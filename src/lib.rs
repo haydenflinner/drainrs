@@ -9,18 +9,117 @@ use std::{collections::HashMap, error::Error};
 
 use log::{debug, info, warn};
 
-// type inference lets us omit an explicit type signature (which
-// would be `BTreeMap<&str, &str>` in this example).
-fn btree() {
-    let mut movie_reviews = BTreeMap::new();
-
-    // review some movies.
-    movie_reviews.insert("Office Space", "Deals with real issues in the workplace.");
-    movie_reviews.insert("Pulp Fiction", "Masterpiece.");
-    movie_reviews.insert("The Godfather", "Very enjoyable.");
-    movie_reviews.insert("The Blues Brothers", "Eye lyked it a lot.");
+#[derive(Default)]
+pub struct ParserState {
+    root: TreeRoot,
+    next_cluster_id: i64,
+     // = TreeRoot::new();
 }
 
+/// Iterator yielding every line in a string. The line includes newline character(s).
+pub struct RecordsParsed<'a> {
+    input: &'a str,
+    state: &'a ParserState,
+}
+
+impl<'a> RecordsParsed<'a> {
+    pub fn from(input: &'a str, state: &'a ParserState) -> RecordsParsed<'a> {
+        RecordsParsed {
+            input: input,
+            state: state,
+        }
+    }
+}
+
+/*struct NewTemplate<'a> {
+    line: &'a str,
+
+}*/
+#[derive(Debug)]
+enum OwningLogTemplateItem {
+    StaticToken(String), // Owned because we need to store it.
+    Value, // Python port used "<*>" instead.
+}
+
+pub enum LogTemplateItem<'a> {
+    StaticToken(&'a str),
+    Value
+}
+
+#[derive(Error, Debug)]
+pub enum ParseError {
+    #[error("couldn't parse line with user defined template, multiline log msg?")]
+    NoTokensInRecord,
+}
+
+pub struct RecordParsed<'a> {
+    template_id: usize,
+    values: &'a [&'a str],
+}
+
+pub enum RecordsParsedResult<'a> {
+    NewTemplate(&'a[LogTemplateItem<'a>]),
+    RecordParsed(RecordParsed<'a>),
+    Done,
+    ParseError(ParseError),
+}
+
+impl<'a> Iterator for RecordsParsed<'a> {
+    //type Item = &'a str;
+    type Item = RecordsParsedResult<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.input.is_empty() {
+            return None;
+        }
+        for line in self.input.lines() {
+            // TODO before returning, advance self.input to not include what we consumed, like the split_at below.
+            // let split = self.input.find('\n').map(|i| i + 1).unwrap_or(self.input.len());
+            // let (line, rest) = self.input.split_at(split);
+            // self.input = rest;
+            // Some(line)
+
+            // Step 1. First we split the line to get all of the tokens.
+            // add_log_message from drain3.py
+            let line = self.input;
+            let line_chunks = split_line_provided(&line); // Pre-defined chunks as user-specified, like <Time> <Content>
+            if let None = line_chunks {
+                // Couldn't parse with the given regex, it's probably a multiline string. Attach it to the last-emitted log.
+                // TODO attach_to_last_line(line);
+                return Some(RecordsParsedResult::ParseError(ParseError::NoTokensInRecord));
+            }
+            // TODO Let Content be something not the last thing in the msg.
+            // For right now it's fine.
+            let line_chunks = line_chunks.unwrap();
+            let log_content = line_chunks.iter().rev().next().unwrap();
+
+            // TODO It owuld be better to keep the string split apart into tokens, rather than rejoining to a string with <*>
+            // both for runtime and for safety (what if <*> occurred in the log msg?)
+            let masked = preprocess_domain_knowledge(log_content);
+            // let tokens: Vec<&str> = masked.split([' ', '\t']).collect();
+            let tokens: Vec<&str> = masked.split([' ', '\t']).collect();
+            if tokens.len() == 0 {
+                unimplemented!("Empty log line or empty parsed. Can't just let this slide, can cause issues in many places..what to do?");
+            }
+
+            // Step 2, we map #(num_tokens) => a parse tree with limited depth.
+            let mut match_cluster = tree_search(&self.state.root, &tokens);
+
+            if match_cluster.is_none() {
+                // We could also inline add_seq_to_prefix_tree here,
+                // Either the prefix tree did not exist, in which case we have to add it and a one-cluster leaf-node.
+                // Or, the prefix tree did exist, but no cluster matched above the threshold, so we need to add a cluster there.
+                match_cluster = Some(add_seq_to_prefix_tree(&mut self.state.root, &tokens, &mut self.state.next_cluster_id));
+                return Some(Self::Item::NewTemplate(line_chunks));
+            }
+            let c = match_cluster.unwrap();
+            return Some(Self::Item::RecordParsed())
+            info!("Line {} matched cluster: {:?}", line, c);
+        }
+        return Some(Self::Item::Done);
+    }
+}
 // First map using token length, then map based on tokens until maxDepth, then we've found it.
 // If all digits token, replace with "*"
 fn similar_sequence_score(seq1: &Vec<&str>, seq2: &Vec<&str>) -> usize {
@@ -57,14 +156,20 @@ fn split_line_provided(_line: &str) -> Option<Vec<&str>> {
 //type Template = Vec<String>;
 //struct
 
+// TODO what should we do about quoted values with spaces in them?
+// the naive tokenizer won't handle this.
+
+// info!("hello this {} value goes here", 42)
+// -> [ StaticToken("hello"), StaticToken("this"), Value("42"), StaticToken... ]
+// Todo use this type-safe approach everywhere rather than the direct <*> port from Python.
 #[derive(Debug)]
 struct LogCluster {
-    template: Vec<String>,
+    template: Vec<OwningLogTemplateItem>,
     cluster_id: i64,
     // size: i64 from Python == num_matches. Why track this? Seems to be only for debugging.
 }
 
-fn sequence_distance(seq1: &Vec<String>, seq2: &Vec<&str>) -> (f64, i64) {
+fn sequence_distance(seq1: &[OwningLogTemplateItem], seq2: &[&str]) -> (f64, i64) {
     assert!(seq1.len() == seq2.len());
     if seq1.len() == 0 {
         return (1.0, 0);
@@ -72,12 +177,15 @@ fn sequence_distance(seq1: &Vec<String>, seq2: &Vec<&str>) -> (f64, i64) {
     let mut sim_tokens: i64 = 0;
     let mut num_of_par = 0;
     for (token1, token2) in seq1.iter().zip(seq2.iter()) {
-        if *token1 == "<*>" {
-            num_of_par += 1;
-            continue;
-        }
-        if token1 == token2 {
-            sim_tokens += 1;
+        match token1 {
+            OwningLogTemplateItem::StaticToken(token1) => {
+                if token1 == token2 {
+                    sim_tokens += 1;
+                }
+            },
+            OwningLogTemplateItem::Value => { // == "<*>"
+                num_of_par += 1;
+            },
         }
     }
     // Params don't match because this way we just skip params, and find the actually most-similar one, rather than letting
@@ -214,7 +322,9 @@ fn add_seq_to_prefix_tree<'a>(
     }}
 }*/
 
-fn tree_search<'a>(root: &'a TreeRoot, tokens: &Vec<&str>) -> Option<&'a LogCluster> {
+// https://developer.ibm.com/blogs/how-mining-log-templates-can-help-ai-ops-in-cloud-scale-data-centers/
+
+fn tree_search<'a>(root: &'a TreeRoot, tokens: &[&str]) -> Option<&'a LogCluster> {
     let token_count = tokens.len();
     assert!(token_count != 0);
     let e = root.get(&token_count);
@@ -318,7 +428,6 @@ fn parse_emit_csv(filename: &str) -> Result<(), Box<dyn Error>> {
     // let arena: mut Arena<String>;
     // let a = arena.new_node(GraphNodeContents::Token("xyz".to_string()));
     // let root = arena.new_node(GraphNodeContents::NumTokens(0));
-    let mut root: TreeRoot = TreeRoot::new();
     // root.prepend(new_child, arena)
     // root.insert_after(new_sibling, arena)
     // arena.nodes[root.index].first_child
@@ -334,42 +443,6 @@ fn parse_emit_csv(filename: &str) -> Result<(), Box<dyn Error>> {
     let mut cluster_id = 0;
 
     for line in reader.lines() {
-        // Step 1. First we split the line to get all of the tokens.
-        // add_log_message from drain3.py
-        let line = line?;
-        let line_chunks = split_line_provided(&line); // Pre-defined chunks as user-specified, like <Time> <Content>
-        if let None = line_chunks {
-            // Couldn't parse with the given regex, it's probably a multiline string. Attach it to the last-emitted log.
-            // TODO attach_to_last_line(line);
-            debug!("Skipping record that couldn't parse with user defined template, multiline log msg?");
-            continue;
-        }
-        // TODO Let Content be something not the last thing in the msg.
-        // For right now it's fine.
-        let line_chunks = line_chunks.unwrap();
-        let log_content = line_chunks.iter().rev().next().unwrap();
-
-        // TODO It owuld be better to keep the string split apart into tokens, rather than rejoining to a string with <*>
-        // both for runtime and for safety (what if <*> occurred in the log msg?)
-        let masked = preprocess_domain_knowledge(log_content);
-        let tokens: Vec<&str> = masked.split([' ', '\t']).collect();
-        if tokens.len() == 0 {
-            unimplemented!("Empty log line or empty parsed. Can't just let this slide, can cause issues in many places..what to do?");
-        }
-
-        // Step 2, we map #(num_tokens) => a parse tree with limited depth.
-        let mut match_cluster = tree_search(&root, &tokens);
-
-        if match_cluster.is_none() {
-            // We could also inline add_seq_to_prefix_tree here,
-            // Either the prefix tree did not exist, in which case we have to add it and a one-cluster leaf-node.
-            // Or, the prefix tree did exist, but no cluster matched above the threshold, so we need to add a cluster there.
-            match_cluster = Some(add_seq_to_prefix_tree(&mut root, &tokens, &mut cluster_id));
-        } else {
-            info!("Matched cluster.");
-        }
-        let c = match_cluster.unwrap();
-        info!("Line {} matched cluster: {:?}", line, c);
     }
 
     Ok(())
@@ -401,6 +474,8 @@ mod tests {
     fn test_a() {
         SimpleLogger::new().init().unwrap();
         parse_emit_csv("testlog1.txt");
+        // TODO emit results as a template plus a dictionary?
+        // template as str minus wildcards?
         assert_eq!(1, 0);
     }
 }
