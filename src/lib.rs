@@ -3,6 +3,7 @@
 #![allow(unused_variables)]
 #[allow(unused_imports)]
 use indextree::Arena;
+use thiserror::Error;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::{BTreeMap, HashSet};
 use std::{collections::HashMap, error::Error};
@@ -12,24 +13,51 @@ use log::{debug, info, warn};
 #[derive(Default)]
 pub struct ParserState {
     root: TreeRoot,
-    next_cluster_id: i64,
+    next_cluster_id: usize,
      // = TreeRoot::new();
 }
+use std::iter::zip;
 
 /// Iterator yielding every line in a string. The line includes newline character(s).
 pub struct RecordsParsed<'a> {
     input: &'a str,
-    state: &'a ParserState,
+    state: &'a mut ParserState,
 }
 
 impl<'a> RecordsParsed<'a> {
-    pub fn from(input: &'a str, state: &'a ParserState) -> RecordsParsed<'a> {
+    pub fn from(input: &'a str, state: &'a mut ParserState) -> RecordsParsed<'a> {
         RecordsParsed {
             input: input,
             state: state,
         }
     }
 }
+
+// Holy cow what ugly syntax to make this generic lol:
+// https://www.reddit.com/r/learnrust/comments/t18ue0/comment/hyepyn9/?utm_source=share&utm_medium=web2x&context=3
+// fn zip_tokens_and_template<'a, 'b>(templatetokens: &[String], logtokens: &'b[&'a str] ) -> Vec<&'a str> {
+// fn zip_tokens_and_template<'a, 'b>(templatetokens: &[String], logtokens: &'b[&'a str] ) -> Vec<&'b str> {
+fn zip_tokens_and_template<'a, 'b>(templatetokens: &[String], logtokens: &'b[&'a str] ) -> Vec<String> {
+    let mut results = Vec::new();
+    for (template_token, log_token) in zip(templatetokens, logtokens) {
+        if *template_token == "<*>" {
+            results.push(log_token.to_string());
+        }
+    }
+    results
+}
+
+fn template_str_to_typed<'a>(templatetokens: &'a[String]) -> Vec<LogTemplateItem> {
+    let mut results = Vec::new();
+    for template_token in templatetokens {
+        results.push(
+            if *template_token == "<*>" { LogTemplateItem::Value }
+            else { LogTemplateItem::StaticToken(template_token.to_string()) }
+        )
+    }
+    results
+}
+
 
 /*struct NewTemplate<'a> {
     line: &'a str,
@@ -41,9 +69,14 @@ enum OwningLogTemplateItem {
     Value, // Python port used "<*>" instead.
 }
 
-pub enum LogTemplateItem<'a> {
+/*pub enum LogTemplateItem<'a> {
     StaticToken(&'a str),
-    Value
+    Value,
+    I can't convince the borrow checker today to allow this :-)
+}*/
+pub enum LogTemplateItem {
+    StaticToken(String),
+    Value,
 }
 
 #[derive(Error, Debug)]
@@ -52,21 +85,25 @@ pub enum ParseError {
     NoTokensInRecord,
 }
 
-pub struct RecordParsed<'a> {
+pub struct RecordParsed {
     template_id: usize,
-    values: &'a [&'a str],
+    // I'd prefer somehow returning an undefined size iterator over a vec,
+    // but we're already in one iterator, perf probably is not that important lol.
+    // values: Vec<&'a str>,
+    values: Vec<String>,
 }
 
-pub enum RecordsParsedResult<'a> {
-    NewTemplate(&'a[LogTemplateItem<'a>]),
-    RecordParsed(RecordParsed<'a>),
+pub enum RecordsParsedResult {
+    NewTemplate(Vec<LogTemplateItem>),
+    RecordParsed(RecordParsed),
     Done,
     ParseError(ParseError),
 }
 
 impl<'a> Iterator for RecordsParsed<'a> {
     //type Item = &'a str;
-    type Item = RecordsParsedResult<'a>;
+    // type Item = RecordsParsedResult<'a>;
+    type Item = RecordsParsedResult;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -97,8 +134,9 @@ impl<'a> Iterator for RecordsParsed<'a> {
             // TODO It owuld be better to keep the string split apart into tokens, rather than rejoining to a string with <*>
             // both for runtime and for safety (what if <*> occurred in the log msg?)
             let masked = preprocess_domain_knowledge(log_content);
-            // let tokens: Vec<&str> = masked.split([' ', '\t']).collect();
             let tokens: Vec<&str> = masked.split([' ', '\t']).collect();
+            // let tokens: Split<Char, 2> = masked.split([' ', '\t']); //.collect();
+            
             if tokens.len() == 0 {
                 unimplemented!("Empty log line or empty parsed. Can't just let this slide, can cause issues in many places..what to do?");
             }
@@ -111,11 +149,19 @@ impl<'a> Iterator for RecordsParsed<'a> {
                 // Either the prefix tree did not exist, in which case we have to add it and a one-cluster leaf-node.
                 // Or, the prefix tree did exist, but no cluster matched above the threshold, so we need to add a cluster there.
                 match_cluster = Some(add_seq_to_prefix_tree(&mut self.state.root, &tokens, &mut self.state.next_cluster_id));
-                return Some(Self::Item::NewTemplate(line_chunks));
+                return Some(Self::Item::NewTemplate(template_str_to_typed(&match_cluster.unwrap().template)));
             }
-            let c = match_cluster.unwrap();
-            return Some(Self::Item::RecordParsed())
-            info!("Line {} matched cluster: {:?}", line, c);
+            let match_cluster = match_cluster.unwrap();
+            info!("Line {} matched cluster: {:?}", line, match_cluster);
+            // It feels like it should be doable to pass tokens without collecting it first,
+            // maintaining its lifetime as pointing to the original record. but skipped for now
+            // since can't figure out how to do that without .collect().
+            return Some(Self::Item::RecordParsed(RecordParsed{
+                values: zip_tokens_and_template(
+                    &match_cluster.template,
+                    &tokens),
+                template_id: match_cluster.cluster_id
+            }));
         }
         return Some(Self::Item::Done);
     }
@@ -164,12 +210,12 @@ fn split_line_provided(_line: &str) -> Option<Vec<&str>> {
 // Todo use this type-safe approach everywhere rather than the direct <*> port from Python.
 #[derive(Debug)]
 struct LogCluster {
-    template: Vec<OwningLogTemplateItem>,
-    cluster_id: i64,
+    template: Vec<String>,
+    cluster_id: usize,
     // size: i64 from Python == num_matches. Why track this? Seems to be only for debugging.
 }
 
-fn sequence_distance(seq1: &[OwningLogTemplateItem], seq2: &[&str]) -> (f64, i64) {
+fn sequence_distance(seq1: &Vec<String>, seq2: &[&str]) -> (f64, i64) {
     assert!(seq1.len() == seq2.len());
     if seq1.len() == 0 {
         return (1.0, 0);
@@ -177,15 +223,12 @@ fn sequence_distance(seq1: &[OwningLogTemplateItem], seq2: &[&str]) -> (f64, i64
     let mut sim_tokens: i64 = 0;
     let mut num_of_par = 0;
     for (token1, token2) in seq1.iter().zip(seq2.iter()) {
-        match token1 {
-            OwningLogTemplateItem::StaticToken(token1) => {
-                if token1 == token2 {
-                    sim_tokens += 1;
-                }
-            },
-            OwningLogTemplateItem::Value => { // == "<*>"
-                num_of_par += 1;
-            },
+        if *token1 == "<*>" {
+            num_of_par += 1;
+            continue;
+        }
+        if token1 == token2 {
+            sim_tokens += 1;
         }
     }
     // Params don't match because this way we just skip params, and find the actually most-similar one, rather than letting
@@ -197,7 +240,7 @@ fn sequence_distance(seq1: &[OwningLogTemplateItem], seq2: &[&str]) -> (f64, i64
 }
 
 const SIMILARITY_THRESHOLD: f64 = 0.7;
-fn fast_match<'a>(logclusts: &'a Vec<LogCluster>, tokens: &Vec<&str>) -> Option<&'a LogCluster> {
+fn fast_match<'a>(logclusts: &'a Vec<LogCluster>, tokens: &[&str]) -> Option<&'a LogCluster> {
     // Sequence similarity search.
     let mut max_similarity = -1.0;
     let mut max_param_count = -1;
@@ -231,7 +274,7 @@ const MAX_CHILDREN: usize = 100;
 fn add_seq_to_prefix_tree<'a>(
     root: &'a mut TreeRoot,
     tokens: &Vec<&str>,
-    num_clusters: &mut i64,
+    num_clusters: &mut usize,
 ) -> &'a LogCluster {
     // Make sure there is a num_token => middle_node element.
     let clust_id = *num_clusters;
@@ -314,13 +357,6 @@ fn add_seq_to_prefix_tree<'a>(
     unreachable!();
 }
 
-/*macro_rules! hashmap {
-    ($( $key: expr => $val: expr ),*) => {{
-         let mut map = ::std::collections::HashMap::new();
-         $( map.insert($key, $val); )*
-         map
-    }}
-}*/
 
 // https://developer.ibm.com/blogs/how-mining-log-templates-can-help-ai-ops-in-cloud-scale-data-centers/
 
@@ -440,12 +476,12 @@ fn parse_emit_csv(filename: &str) -> Result<(), Box<dyn Error>> {
     // logMessageL = line['content']
     // We're basically bypassing the tree with our hand-written regex.
 
-    let mut cluster_id = 0;
+    // let mut cluster_id = 0;
 
-    for line in reader.lines() {
-    }
-
-    Ok(())
+    /*for line in reader.lines() {
+    }*/
+    todo!("Use the new API here.");
+    // Ok(())
 }
 
 #[cfg(test)]

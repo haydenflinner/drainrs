@@ -9,5 +9,7 @@ edition = "2021"
 indextree = "4.5.0"
 regex = "1"
 log = "0.4.17"
+thiserror = "1.0"
+
 [dev-dependencies]
 simple_logger = "4.0.0"
