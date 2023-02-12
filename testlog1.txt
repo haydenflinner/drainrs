@@ -8,4 +8,4 @@
 12:41 DEBUG ClassA::FuncB hello new line x=24, y=48
 12:42 INFO new line.
 12:42 INFO new line two.
-12:41 DEBUG ClassA::FuncA x=21, y=48
+12:43 DEBUG ClassA::FuncA x=21, y=48
