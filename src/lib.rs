@@ -8,10 +8,11 @@ use simple_logger::SimpleLogger;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::{collections::HashMap, error::Error};
+use std::error::Error;
 use thiserror::Error;
 use serde_json::json;
 use log::{debug, info, warn};
+use rustc_hash::FxHashMap;
 
 /// In the process of parsing, the drain algo creates a Parse tree. This tree can be saved
 /// and re-used on the next run, to avoid "forgetting" the previously recognized log templates.
@@ -27,11 +28,12 @@ use std::iter::zip;
 // https://www.reddit.com/r/learnrust/comments/t18ue0/comment/hyepyn9/?utm_source=share&utm_medium=web2x&context=3
 // fn zip_tokens_and_template<'a, 'b>(templatetokens: &[String], logtokens: &'b[&'a str] ) -> Vec<&'a str> {
 // fn zip_tokens_and_template<'a, 'b>(templatetokens: &[String], logtokens: &'b[&'a str] ) -> Vec<&'b str> {
-fn zip_tokens_and_template<'a, 'b, 'c>(
-    templatetokens: &'a [OwningLogTemplateItem],
-    logtokens: &'b [TokenParse<'c>],
-) -> Vec<&'c str> {
-    let mut results = Vec::new();
+fn zip_tokens_and_template<'c>(
+    templatetokens: &[OwningLogTemplateItem],
+    logtokens: &[TokenParse<'c>],
+    results: &mut Vec<&'c str>
+) {
+    results.clear();
     for (template_token, log_token) in zip(templatetokens, logtokens) {
         match template_token {
             OwningLogTemplateItem::StaticToken(_) => {}
@@ -41,7 +43,6 @@ fn zip_tokens_and_template<'a, 'b, 'c>(
             },
         }
     }
-    results
 }
 
 /*struct NewTemplate<'a> {
@@ -100,10 +101,9 @@ pub enum ParseError {
 #[derive(Debug)]
 pub struct RecordParsed<'a> {
     pub template_id: usize,
-    // I'd prefer somehow returning an undefined size iterator over a vec,
-    // but we're already in one iterator, perf probably is not that important lol.
+    // Can't get this to compile. Doesn't seem to be a big deal perf-wise.
+    // pub values: &'short[&'a str],
     pub values: Vec<&'a str>,
-    // values: Vec<^'a str>,
 }
 
 #[derive(Debug)]
@@ -121,21 +121,25 @@ pub enum RecordsParsedResult<'a> {
 
 /// Iterator yielding every log record in the input string. A log record is generally a log-line,
 /// but can be multi-line.
-pub struct RecordsParsed<'a> {
+pub struct RecordsParsed<'a, 'b: 'a> {
     pub input: &'a str,
-    pub state: &'a mut ParserState,
+    pub state: &'b mut ParserState,
+    tokens: Vec<TokenParse<'a>>,
+    parsed: &'a mut Vec<&'a str>,
 }
 
-impl<'a> RecordsParsed<'a> {
-    pub fn from(input: &'a str, state: &'a mut ParserState) -> RecordsParsed<'a> {
+impl<'a, 'b> RecordsParsed<'a, 'b> {
+    pub fn from(input: &'a str, state: &'b mut ParserState, parsed_buffer: &'a mut Vec<&'a str>) -> RecordsParsed<'a, 'b> {
         RecordsParsed {
-            input: input,
-            state: state,
+            input,
+            state,
+            tokens: Vec::new(),
+            parsed: parsed_buffer,
         }
     }
 }
 
-impl<'a> Iterator for RecordsParsed<'a> {
+impl<'a, 'b> Iterator for RecordsParsed<'a, 'b> {
     type Item = RecordsParsedResult<'a>;
 
     #[inline]
@@ -158,7 +162,7 @@ impl<'a> Iterator for RecordsParsed<'a> {
         // Step 1. First we split the line to get all of the tokens.
         // add_log_message from drain3.py
         // E.g. splits the line into chunks <timestamp> <loglevel> <content>
-        let line_chunks = split_line_provided(&line); // Pre-defined chunks as user-specified, like <Time> <Content>
+        let line_chunks = split_line_provided(line); // Pre-defined chunks as user-specified, like <Time> <Content>
         if line_chunks.is_none() {
             // Couldn't parse with the given regex, it's probably a multiline string. Attach it to the last-emitted log.
             // TODO attach_to_last_line(line);
@@ -199,7 +203,7 @@ impl<'a> Iterator for RecordsParsed<'a> {
                 preprocessed.push(Preprocessed::Segment(&log_content[last_index..]));
             }
         } else {
-            preprocessed.push(Preprocessed::Segment(&log_content[..]));
+            preprocessed.push(Preprocessed::Segment(log_content));
         }
 
         // re.find_iter(log_content).map(|mmatch| PreProcessed(PreProcessed::Segment(mmatch.range()))).intersperse(separator)
@@ -211,20 +215,21 @@ impl<'a> Iterator for RecordsParsed<'a> {
         //re.replace_all(s, "<*>").to_string()
         // };
 
-        let mut tokens = Vec::new();
+        let tokens = &mut self.tokens;
+        tokens.clear();
         debug!("preprocessed={:?}", preprocessed);
         for elem in preprocessed {
             match elem {
                 Preprocessed::Segment(s) => tokens.extend(
                     s.split([' ', '\t'])
-                        .filter(|s| s.len() > 0)
-                        .map(|t| TokenParse::Token(t)),
+                        .filter(|s| !s.is_empty())
+                        .map(TokenParse::Token),
                 ),
                 Preprocessed::Value(v) => tokens.push(TokenParse::MaskedValue(v)),
             }
         }
 
-        if tokens.len() == 0 {
+        if tokens.is_empty() {
             unimplemented!("Empty log line or empty parsed. Can't just let this slide, can cause issues in many places..what to do?");
         }
 
@@ -239,12 +244,13 @@ impl<'a> Iterator for RecordsParsed<'a> {
                 &mut self.state.root,
                 &tokens,
                 &mut self.state.next_cluster_id,
-            ))
-            .unwrap();
+            )).unwrap();
+            self.parsed.clear();
+            zip_tokens_and_template(&match_cluster.template, &tokens, self.parsed);
             return Some(Self::Item::NewTemplate(NewTemplate {
                 template: match_cluster.template.to_vec(),
                 first_parse: RecordParsed {
-                    values: zip_tokens_and_template(&match_cluster.template, &tokens),
+                    values: self.parsed.to_vec(),
                     template_id: match_cluster.cluster_id,
                 },
             }));
@@ -254,8 +260,10 @@ impl<'a> Iterator for RecordsParsed<'a> {
         // It feels like it should be doable to pass tokens without collecting it first,
         // maintaining its lifetime as pointing to the original record. but skipped for now
         // since can't figure out how to do that without .collect().
+        self.parsed.clear();
+        zip_tokens_and_template(&match_cluster.template, &tokens, self.parsed);
         return Some(Self::Item::RecordParsed(RecordParsed {
-            values: zip_tokens_and_template(&match_cluster.template, &tokens),
+            values: self.parsed.to_vec(),
             template_id: match_cluster.cluster_id,
         }));
     }
@@ -280,10 +288,7 @@ fn has_numbers(s: &str) -> bool {
 // SmallVec would be good here.
 fn split_line_provided(_line: &str) -> Option<Vec<&str>> {
     // TODO Copy regex from python, return list of spanning indicators.
-    // None
-    let mut vec = Vec::new();
-    vec.push(_line);
-    Some(vec)
+    Some(vec![_line])
 }
 
 // fn get_template(new_template_tokens: Vec<&str>, old_template_tokens: Vec<&str>) -> Vec<&str> {
@@ -309,9 +314,9 @@ struct LogCluster {
     // size: i64 from Python == num_matches. Why track this? Seems to be only for debugging.
 }
 
-fn sequence_distance(seq1: &Vec<OwningLogTemplateItem>, seq2: &[TokenParse]) -> (f64, i64) {
+fn sequence_distance(seq1: &[OwningLogTemplateItem], seq2: &[TokenParse]) -> (f64, i64) {
     assert!(seq1.len() == seq2.len());
-    if seq1.len() == 0 {
+    if seq1.is_empty() {
         return (1.0, 0);
     }
     let mut sim_tokens: i64 = 0;
@@ -334,10 +339,11 @@ fn sequence_distance(seq1: &Vec<OwningLogTemplateItem>, seq2: &[TokenParse]) -> 
 
     // let retVal = f64::from(simTokens) / f64::from(seq1.len());
     let ret_val = sim_tokens as f64 / seq1.len() as f64;
-    return (ret_val, num_of_par);
+    (ret_val, num_of_par)
 }
 
-const SIMILARITY_THRESHOLD: f64 = 0.7;
+// const SIMILARITY_THRESHOLD: f64 = 0.7;
+const SIMILARITY_THRESHOLD: f64 = 0.4;
 fn fast_match<'a>(logclusts: &'a Vec<LogCluster>, tokens: &[TokenParse]) -> Option<&'a LogCluster> {
     // Sequence similarity search.
     let mut max_similarity = -1.0;
@@ -367,7 +373,8 @@ fn fast_match<'a>(logclusts: &'a Vec<LogCluster>, tokens: &[TokenParse]) -> Opti
 // 20221213 Note; the plan is basically just to translate the Python to Rust
 // And then build some tests
 // Then we can refactor to our hearts content.
-const MAX_DEPTH: usize = 100;
+// const MAX_DEPTH: usize = 100;
+const MAX_DEPTH: usize = 4;
 const MAX_CHILDREN: usize = 100;
 fn add_seq_to_prefix_tree<'a>(
     root: &'a mut TreeRoot,
@@ -382,7 +389,7 @@ fn add_seq_to_prefix_tree<'a>(
     assert!(token_count >= 2);
     let mut cur_node = root.entry(token_count).or_insert_with(|| {
         GraphNodeContents::MiddleNode(MiddleNode {
-            child_d: HashMap::new(),
+            child_d: FxHashMap::default(),
         })
     });
 
@@ -397,7 +404,7 @@ fn add_seq_to_prefix_tree<'a>(
                 GraphNodeContents::LeafNode(Vec::new())
             } else {
                 GraphNodeContents::MiddleNode(MiddleNode {
-                    child_d: HashMap::new(),
+                    child_d: FxHashMap::default(),
                 })
             }
         };
@@ -477,9 +484,7 @@ fn tree_search<'a>(root: &'a TreeRoot, tokens: &[TokenParse]) -> Option<&'a LogC
     assert!(token_count != 0);
     let e = root.get(&token_count);
     // No template with same token count yet.
-    if e.is_none() {
-        return None;
-    }
+    e?;
 
     let mut cur_node = e.unwrap();
     /*if let GraphNodeContents::LeafNode(p) = parentn {
@@ -505,8 +510,8 @@ fn tree_search<'a>(root: &'a TreeRoot, tokens: &[TokenParse]) -> Option<&'a LogC
         match token {
             TokenParse::MaskedValue(v) => {
                 let maybe_next = middle.child_d.get(&OwningLogTemplateItem::Value);
-                if maybe_next.is_some() {
-                    cur_node = maybe_next.unwrap();
+                if let Some(next) = maybe_next {
+                    cur_node = next;
                 } else {
                     return None;
                 }
@@ -516,8 +521,8 @@ fn tree_search<'a>(root: &'a TreeRoot, tokens: &[TokenParse]) -> Option<&'a LogC
                 let maybe_next = middle
                     .child_d
                     .get(&OwningLogTemplateItem::StaticToken(token.to_string()));
-                if maybe_next.is_some() {
-                    cur_node = maybe_next.unwrap();
+                if let Some(next) = maybe_next {
+                    cur_node = next;
                 } else if let Some(wildcard) = middle.child_d.get(&OwningLogTemplateItem::Value) {
                     cur_node = wildcard;
                 } else {
@@ -534,7 +539,7 @@ fn tree_search<'a>(root: &'a TreeRoot, tokens: &[TokenParse]) -> Option<&'a LogC
         GraphNodeContents::LeafNode(x) => x,
     };
     let ret_log_clust = fast_match(log_clust, tokens);
-    return ret_log_clust;
+    ret_log_clust
 }
 
 //enum GraphNodeContents {
@@ -555,7 +560,7 @@ fn tree_search<'a>(root: &'a TreeRoot, tokens: &[TokenParse]) -> Option<&'a LogC
 // indextree and o(n) children walk through doing equality, rather than hashing? let's leave it alone til it works then we can make it fast.
 #[derive(Debug)]
 struct MiddleNode {
-    child_d: HashMap<OwningLogTemplateItem, GraphNodeContents>,
+    child_d: FxHashMap<OwningLogTemplateItem, GraphNodeContents>,
     // TODO Remove The value of token here is not clear since it is also known by the path that we walked to the node from?
     // token: String,
 }
@@ -567,7 +572,7 @@ enum GraphNodeContents {
 }
 
 // type TreeNode = HashMap<String, GraphNodeContents>;
-type TreeRoot = HashMap<usize, GraphNodeContents>;
+type TreeRoot = FxHashMap<usize, GraphNodeContents>;
 
 use regex::{Match, Regex, Split};
 
@@ -606,7 +611,6 @@ fn parse_emit_csv(filename: &str) -> Result<(), Box<dyn Error>> {
 }
 
 pub fn print_log(filename: &str) {
-    SimpleLogger::new().init().unwrap();
     //let file = File::open("testlog1.txt").unwrap();
     //let reader = BufReader::new(file);
     // parse_emit_csv("testlog1.txt");
@@ -621,11 +625,8 @@ pub fn print_log(filename: &str) {
     // Let's convert to jsonl.
     // let mut tables: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut template_names = Vec::new();
-    for record in (RecordsParsed {
-        input: &s,
-        state: &mut state,
-    }) {
-        fn handle_parse(template_names: &Vec<String>, rp: &RecordParsed) {
+    for record in RecordsParsed::from(&s, &mut state, &mut Vec::new()) {
+        fn handle_parse(template_names: &[String], rp: &RecordParsed) {
             // let m: HashMap<String, String> = HashMap::new();
             // prefixes=
             //let obj = object!["type": typ];
@@ -664,7 +665,6 @@ mod tests {
     // use super::*;
 
     use std::{
-        collections::HashMap,
         fs::{read_to_string, File},
         io::BufReader,
     };

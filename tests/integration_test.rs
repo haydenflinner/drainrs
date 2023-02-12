@@ -9,6 +9,8 @@ use simple_logger::SimpleLogger;
 
 #[test]
 fn test_a() {
-    print_log("apache-short.log");
+    // SimpleLogger::new().init().unwrap();
+    // print_log("apache-short.log");
+    print_log("Apache.log");
     assert_eq!(1, 0);
 }
