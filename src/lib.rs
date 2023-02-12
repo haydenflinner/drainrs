@@ -1,43 +1,67 @@
-#![allow(unused_imports)]
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
 #![feature(iter_intersperse)]
-use indextree::Arena;
-use simple_logger::SimpleLogger;
+#![feature(hash_raw_entry)]
+//! rdrain implements the [Drain]() algorithm for automatic log parsing.
+//! # Example:
+//! 
+
+//! # Vocabulary
+//! A **log record** is an entry in a text file, typically one-line but doesn't have to be.
+//!
+//!   E.g. `[Thu Jun 09 06:07:05 2005] [notice] Digest logline here: done`
+//!
+//!
+//! A **log template** is the string template that was used to format log record.
+//!
+//! For example in Python format, that would look like this:
+//!
+//!   `"[{date}] [{log_level}] Digest logline here: {status}".format(...)`
+//!
+//! Or in the syntax output by drain.py and drain3.py:
+//!
+//!   `"[<date>] [<log_level>] Digest logline here: <*>"`
+//!
+//! # TODO
+//! The first drain allowed `split_line_provided`, which let you write a simple token-mapper like this:
+//!
+//!   `<timestamp> <loglevel> <content>`
+//!
+//! And then drain would only apply its logic to `<content>`.
+//!
+//! Drain3 appears to have dropped this in favor of preprocessing on the user-code side, which is fair enough.
+//!
+//! Drain3 allows "masking", which appears to be for recognizing values like IPs or numbers.
+//! We have preliminary support for masking but it's not configurable from outside of the class and the user interface
+//! to it is not yet defined.
+
 use std::collections::hash_map::Entry::{Occupied, Vacant};
-use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::error::Error;
 use thiserror::Error;
-use serde_json::json;
-use log::{debug, info, warn};
+use log::{debug, info, error};
 use rustc_hash::FxHashMap;
+use json_in_type::*;
+use json_in_type::list::ToJSONList;
+use std::iter::zip;
 
-/// In the process of parsing, the drain algo creates a Parse tree. This tree can be saved
+/// In the process of parsing, the drain algo populates a ParseTree. This tree could be saved
 /// and re-used on the next run, to avoid "forgetting" the previously recognized log templates.
 #[derive(Default)]
-pub struct ParserState {
+pub struct ParseTree {
     root: TreeRoot,
     next_cluster_id: usize,
     // = TreeRoot::new();
 }
-use std::iter::zip;
 
-// Holy cow what ugly syntax to make this generic lol:
-// https://www.reddit.com/r/learnrust/comments/t18ue0/comment/hyepyn9/?utm_source=share&utm_medium=web2x&context=3
-// fn zip_tokens_and_template<'a, 'b>(templatetokens: &[String], logtokens: &'b[&'a str] ) -> Vec<&'a str> {
-// fn zip_tokens_and_template<'a, 'b>(templatetokens: &[String], logtokens: &'b[&'a str] ) -> Vec<&'b str> {
 fn zip_tokens_and_template<'c>(
-    templatetokens: &[OwningLogTemplateItem],
+    templatetokens: &[LogTemplateItem],
     logtokens: &[TokenParse<'c>],
     results: &mut Vec<&'c str>
 ) {
     results.clear();
     for (template_token, log_token) in zip(templatetokens, logtokens) {
         match template_token {
-            OwningLogTemplateItem::StaticToken(_) => {}
-            OwningLogTemplateItem::Value => match log_token {
+            LogTemplateItem::StaticToken(_) => {}
+            LogTemplateItem::Value => match log_token {
                 TokenParse::Token(v) => results.push(*v),
                 TokenParse::MaskedValue(v) => results.push(*v),
             },
@@ -45,17 +69,21 @@ fn zip_tokens_and_template<'c>(
     }
 }
 
-/*struct NewTemplate<'a> {
-    line: &'a str,
-
-}*/
+/// The elements in a LogTemplate (not a record).
+/// Given a log-template (in string form) like this,
+///
+///   `"[{date}] [{log_level}] Digest logline here: {status}"`
+///
+///  the parsed rich-type form would be:
+///
+///   `[Value, Value, StaticToken("Digest"), StaticToken("logline"), StaticToken("here:"), Value]`
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub enum OwningLogTemplateItem {
+pub enum LogTemplateItem {
     StaticToken(String), // Owned because we need to store it.
     Value,               // Python port used "<*>" instead.
 }
 
-impl fmt::Display for OwningLogTemplateItem {
+impl fmt::Display for LogTemplateItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -68,19 +96,6 @@ impl fmt::Display for OwningLogTemplateItem {
     }
 }
 
-/*impl From<TokenParse<'a>> for OwningLogTemplateItem {
-    fn from(tp: TokenParse<'a>) -> Self {
-        match ()
-        OwningLogTemplateItem::StaticToken(())
-    }
-
-}*/
-
-/*pub enum LogTemplateItem<'a> {
-    StaticToken(&'a str),
-    Value,
-    I can't convince the borrow checker today to allow this :-)
-}*/
 #[derive(Debug)]
 enum TokenParse<'a> {
     Token(&'a str),
@@ -98,20 +113,32 @@ pub enum ParseError {
     NoTokensInRecord,
 }
 
+/// For each log record, contains template_id the record belongs to, and `values` used to create the record.
 #[derive(Debug)]
 pub struct RecordParsed<'a> {
+    /// Maps 1:1 to the order of NewTemplates recognized.
+    /// Use this to map to any state you stored when recvd NewTemplate.
     pub template_id: usize,
+    /// The values used to populate the record from the template. Given the following template:
+    ///
+    ///   `[Value, Value, StaticToken("Digest"), StaticToken("logline"), StaticToken("here:"), Value]`
+    /// values for a particular record might be:
+    ///
+    /// E.g. ["Thu Jun 09 06:07:05 2005", "notice", "done"]
+    pub values: Vec<&'a str>,
     // Can't get this to compile. Doesn't seem to be a big deal perf-wise.
     // pub values: &'short[&'a str],
-    pub values: Vec<&'a str>,
 }
 
+/// When a new log-template is discovered, rdrain will return this item.
+/// Don't forget to refer to first_parse.
 #[derive(Debug)]
 pub struct NewTemplate<'a> {
-    pub template: Vec<OwningLogTemplateItem>,
+    pub template: LogTemplate,
     pub first_parse: RecordParsed<'a>,
 }
 
+/// 
 #[derive(Debug)]
 pub enum RecordsParsedResult<'a> {
     NewTemplate(NewTemplate<'a>),
@@ -121,16 +148,16 @@ pub enum RecordsParsedResult<'a> {
 
 /// Iterator yielding every log record in the input string. A log record is generally a log-line,
 /// but can be multi-line.
-pub struct RecordsParsed<'a, 'b: 'a> {
+pub struct RecordsParsedIter<'a, 'b: 'a> {
     pub input: &'a str,
-    pub state: &'b mut ParserState,
+    pub state: &'b mut ParseTree,
     tokens: Vec<TokenParse<'a>>,
     parsed: &'a mut Vec<&'a str>,
 }
 
-impl<'a, 'b> RecordsParsed<'a, 'b> {
-    pub fn from(input: &'a str, state: &'b mut ParserState, parsed_buffer: &'a mut Vec<&'a str>) -> RecordsParsed<'a, 'b> {
-        RecordsParsed {
+impl<'a, 'b> RecordsParsedIter<'a, 'b> {
+    pub fn from(input: &'a str, state: &'b mut ParseTree, parsed_buffer: &'a mut Vec<&'a str>) -> RecordsParsedIter<'a, 'b> {
+        RecordsParsedIter {
             input,
             state,
             tokens: Vec::new(),
@@ -139,14 +166,12 @@ impl<'a, 'b> RecordsParsed<'a, 'b> {
     }
 }
 
-impl<'a, 'b> Iterator for RecordsParsed<'a, 'b> {
+impl<'a, 'b> Iterator for RecordsParsedIter<'a, 'b> {
     type Item = RecordsParsedResult<'a>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        info!("self.input={:?}", self.input);
         let split_result = self.input.split_once('\n');
-        info!("split_result={:?}", split_result);
         let (line, next_input) = match split_result {
             Some((line, rest)) => (line.strip_suffix('\r').unwrap_or(line), rest),
             None => (self.input, &self.input[0..0]),
@@ -159,6 +184,7 @@ impl<'a, 'b> Iterator for RecordsParsed<'a, 'b> {
         // It is easily fixed in the python by looking back, not so simple here.
         // We will probably have to iterate through lines looking ahead.
 
+
         // Step 1. First we split the line to get all of the tokens.
         // add_log_message from drain3.py
         // E.g. splits the line into chunks <timestamp> <loglevel> <content>
@@ -170,26 +196,16 @@ impl<'a, 'b> Iterator for RecordsParsed<'a, 'b> {
                 ParseError::NoTokensInRecord,
             ));
         }
-        // TODO Let Content be something not the last thing in the msg.
+        // TODO Let Content be something not the last thing in the msg, like for trailing log-line tags.
         let line_chunks = line_chunks.unwrap();
         let log_content = *line_chunks.iter().rev().next().unwrap();
 
-        // TODO It owuld be better to keep the string split apart into tokens, rather than rejoining to a string with <*>
-        // both for runtime and for safety (what if <*> occurred in the log msg?)
-        // preprocess_domain_knowledge. I.e. splitting the content into strs and KnownValues.
-        // We do this _before_ we split on whitespace in case the known value includes whitespace.
-        // Example use: recognizing MyLoggedMsg{key: value} as one big token for automated parsing.
-        // let re = Regex::new(r"\d+").unwrap();
         // This is the masking feature from drain3; not clear what scenarios
         // would be best to use it, but running without it for now.
         let mut preprocessed = Vec::new();
         if false {
             let re = Regex::new(r"\d+").unwrap();
-            // let mut content_tokens = Vec::new();
             let mut last_index = 0;
-            //for segment in re.split(log_content) {
-            //if segment.ind
-            //}
             for mmatch in re.find_iter(log_content) {
                 if mmatch.start() > last_index {
                     preprocessed.push(Preprocessed::Segment(
@@ -206,15 +222,6 @@ impl<'a, 'b> Iterator for RecordsParsed<'a, 'b> {
             preprocessed.push(Preprocessed::Segment(log_content));
         }
 
-        // re.find_iter(log_content).map(|mmatch| PreProcessed(PreProcessed::Segment(mmatch.range()))).intersperse(separator)
-        // let masked = {
-        // TODO Configurable domain knowledge regexes, called "reg" in python
-        // Worked fine for the research paper so will work fine here prolly.
-        // re.split(log_content)
-        // re.find_iter(text)
-        //re.replace_all(s, "<*>").to_string()
-        // };
-
         let tokens = &mut self.tokens;
         tokens.clear();
         debug!("preprocessed={:?}", preprocessed);
@@ -230,11 +237,11 @@ impl<'a, 'b> Iterator for RecordsParsed<'a, 'b> {
         }
 
         if tokens.is_empty() {
-            unimplemented!("Empty log line or empty parsed. Can't just let this slide, can cause issues in many places..what to do?");
+            return Some(RecordsParsedResult::ParseError(ParseError::NoTokensInRecord));
         }
 
         // Step 2, we map #(num_tokens) => a parse tree with limited depth.
-        let match_cluster = tree_search(&self.state.root, &tokens);
+        let match_cluster = tree_search(&self.state.root, tokens);
 
         if match_cluster.is_none() {
             // We could also inline add_seq_to_prefix_tree here,
@@ -248,6 +255,9 @@ impl<'a, 'b> Iterator for RecordsParsed<'a, 'b> {
             self.parsed.clear();
             zip_tokens_and_template(&match_cluster.template, &tokens, self.parsed);
             return Some(Self::Item::NewTemplate(NewTemplate {
+                // We can't return this because it would imply that our mutable self borrow in Self::next outlives 'a.
+                // We could make this less-copy by using a streaming-iterator or just taking callbacks to call.
+                // Unclear which would be more idiomatic, so leaving it alone for now.
                 template: match_cluster.template.to_vec(),
                 first_parse: RecordParsed {
                     values: self.parsed.to_vec(),
@@ -256,7 +266,7 @@ impl<'a, 'b> Iterator for RecordsParsed<'a, 'b> {
             }));
         }
         let match_cluster = match_cluster.unwrap();
-        info!("Line {} matched cluster: {:?}", line, match_cluster);
+        debug!("Line {} matched cluster: {:?}", line, match_cluster);
         // It feels like it should be doable to pass tokens without collecting it first,
         // maintaining its lifetime as pointing to the original record. but skipped for now
         // since can't figure out how to do that without .collect().
@@ -285,36 +295,19 @@ fn has_numbers(s: &str) -> bool {
     s.chars().any(char::is_numeric)
 }
 
-// SmallVec would be good here.
 fn split_line_provided(_line: &str) -> Option<Vec<&str>> {
     // TODO Copy regex from python, return list of spanning indicators.
     Some(vec![_line])
 }
 
-// fn get_template(new_template_tokens: Vec<&str>, old_template_tokens: Vec<&str>) -> Vec<&str> {
-//     assert_eq!(new_template_tokens.len(), old_template_tokens.len());
-//
-//     new_template_tokens.iter()
-//       .zip(old_template_tokens.iter())
-//       .map(|(o, n)| if **o != **n { "<*>" } else {*o }).collect()
-// }
-//type Template = Vec<String>;
-//struct
-
-// TODO what should we do about quoted values with spaces in them?
-// the naive tokenizer won't handle this.
-
-// info!("hello this {} value goes here", 42)
-// -> [ StaticToken("hello"), StaticToken("this"), Value("42"), StaticToken... ]
-// Todo use this type-safe approach everywhere rather than the direct <*> port from Python.
 #[derive(Debug)]
 struct LogCluster {
-    template: Vec<OwningLogTemplateItem>,
+    template: LogTemplate,
     cluster_id: usize,
     // size: i64 from Python == num_matches. Why track this? Seems to be only for debugging.
 }
 
-fn sequence_distance(seq1: &[OwningLogTemplateItem], seq2: &[TokenParse]) -> (f64, i64) {
+fn sequence_distance(seq1: &[LogTemplateItem], seq2: &[TokenParse]) -> (f64, i64) {
     assert!(seq1.len() == seq2.len());
     if seq1.is_empty() {
         return (1.0, 0);
@@ -323,8 +316,8 @@ fn sequence_distance(seq1: &[OwningLogTemplateItem], seq2: &[TokenParse]) -> (f6
     let mut num_of_par = 0;
     for (token1, token2) in seq1.iter().zip(seq2.iter()) {
         match token1 {
-            OwningLogTemplateItem::Value => num_of_par += 1,
-            OwningLogTemplateItem::StaticToken(token1) => match token2 {
+            LogTemplateItem::Value => num_of_par += 1,
+            LogTemplateItem::StaticToken(token1) => match token2 {
                 TokenParse::Token(token2) => {
                     if token1 == token2 {
                         sim_tokens += 1
@@ -370,10 +363,6 @@ fn fast_match<'a>(logclusts: &'a Vec<LogCluster>, tokens: &[TokenParse]) -> Opti
     }
 }
 
-// 20221213 Note; the plan is basically just to translate the Python to Rust
-// And then build some tests
-// Then we can refactor to our hearts content.
-// const MAX_DEPTH: usize = 100;
 const MAX_DEPTH: usize = 4;
 const MAX_CHILDREN: usize = 100;
 fn add_seq_to_prefix_tree<'a>(
@@ -384,7 +373,7 @@ fn add_seq_to_prefix_tree<'a>(
     // Make sure there is a num_token => middle_node element.
     let clust_id = *num_clusters;
     *num_clusters += 1;
-    info!("Adding seq {} to tree: {:?}", clust_id, tokens);
+    debug!("Adding seq {} to tree: {:?}", clust_id, tokens);
     let token_count = tokens.len();
     assert!(token_count >= 2);
     let mut cur_node = root.entry(token_count).or_insert_with(|| {
@@ -392,10 +381,6 @@ fn add_seq_to_prefix_tree<'a>(
             child_d: FxHashMap::default(),
         })
     });
-
-    // TODO Could fix all this one-token nonsense by hardcoding a rule for 1-token "<*>".
-    // 1 => { "ABC": [1 LogCLuster], "DEF": [1 LogCluster]}
-    // 2 => {"ABC": { "token2": [ x logclusters...]}}
 
     let mut current_depth = 1;
     for token in tokens {
@@ -418,11 +403,11 @@ fn add_seq_to_prefix_tree<'a>(
                 match token {
                     TokenParse::MaskedValue(v) => middle
                         .child_d
-                        .entry(OwningLogTemplateItem::Value)
+                        .entry(LogTemplateItem::Value)
                         .or_insert_with(inserter),
                     TokenParse::Token(token) => {
                         let perfect_match_key =
-                            OwningLogTemplateItem::StaticToken(token.to_string());
+                            LogTemplateItem::StaticToken(token.to_string());
                         let found_node = middle.child_d.contains_key(&perfect_match_key);
 
                         // Double-lookup pleases the borrow-checker :shrug:
@@ -437,7 +422,7 @@ fn add_seq_to_prefix_tree<'a>(
                             if has_numbers(token) || num_children >= MAX_CHILDREN {
                                 middle
                                     .child_d
-                                    .entry(OwningLogTemplateItem::Value)
+                                    .entry(LogTemplateItem::Value)
                                     .or_insert_with(inserter)
                             } else {
                                 // It's not a numerical token, and there is room (maxChildren), add it.
@@ -459,11 +444,11 @@ fn add_seq_to_prefix_tree<'a>(
                         .map(|tp| match tp {
                             TokenParse::Token(t) => {
                                 match has_numbers(t) {
-                                    true => OwningLogTemplateItem::Value,
-                                    false => OwningLogTemplateItem::StaticToken(t.to_string()),
+                                    true => LogTemplateItem::Value,
+                                    false => LogTemplateItem::StaticToken(t.to_string()),
                                 }
                             }
-                            TokenParse::MaskedValue(v) => OwningLogTemplateItem::Value,
+                            TokenParse::MaskedValue(v) => LogTemplateItem::Value,
                         })
                         .collect(),
                     cluster_id: clust_id,
@@ -509,7 +494,7 @@ fn tree_search<'a>(root: &'a TreeRoot, tokens: &[TokenParse]) -> Option<&'a LogC
         // If we know it's a Value, go ahead and take that branch.
         match token {
             TokenParse::MaskedValue(v) => {
-                let maybe_next = middle.child_d.get(&OwningLogTemplateItem::Value);
+                let maybe_next = middle.child_d.get(&LogTemplateItem::Value);
                 if let Some(next) = maybe_next {
                     cur_node = next;
                 } else {
@@ -520,10 +505,10 @@ fn tree_search<'a>(root: &'a TreeRoot, tokens: &[TokenParse]) -> Option<&'a LogC
                 // Actually walking to next child, look for the token, or a wildcard, or fail.
                 let maybe_next = middle
                     .child_d
-                    .get(&OwningLogTemplateItem::StaticToken(token.to_string()));
+                    .get(&LogTemplateItem::StaticToken(token.to_string()));
                 if let Some(next) = maybe_next {
                     cur_node = next;
-                } else if let Some(wildcard) = middle.child_d.get(&OwningLogTemplateItem::Value) {
+                } else if let Some(wildcard) = middle.child_d.get(&LogTemplateItem::Value) {
                     cur_node = wildcard;
                 } else {
                     return None; // Tried going down prefix tree that did not exist, need to make a new entry.
@@ -542,27 +527,9 @@ fn tree_search<'a>(root: &'a TreeRoot, tokens: &[TokenParse]) -> Option<&'a LogC
     ret_log_clust
 }
 
-//enum GraphNodeContents {
-// NumTokens(usize), // First-level
-// Token(String), // Intermediate-levels
-// I know the paper diagram shows a List of LogGroups as the leaf node,
-// but what they actually do in the code is store one LogEvent which contains a template,
-// And they just update that template to parameterize values which are later seen to have changed.
-// I'm not storing logIDs because that was apparently only for the later post analysis in the python.
-// Last level, leaf, contains log template.
-// The paper also says that it will traverse "depth" nodes in Step3, where depth is the amxDepth.
-// This isn't strictly true, there are _at most_ that many nodes.
-// LogCluster(Vec<String>)
-// LogCluster(Vec<String>)
-// }
-
-// TODO Replace this with the probably-much-faster vec-arena-graph thing first drafted.
-// indextree and o(n) children walk through doing equality, rather than hashing? let's leave it alone til it works then we can make it fast.
 #[derive(Debug)]
 struct MiddleNode {
-    child_d: FxHashMap<OwningLogTemplateItem, GraphNodeContents>,
-    // TODO Remove The value of token here is not clear since it is also known by the path that we walked to the node from?
-    // token: String,
+    child_d: FxHashMap<LogTemplateItem, GraphNodeContents>,
 }
 
 #[derive(Debug)]
@@ -571,73 +538,26 @@ enum GraphNodeContents {
     LeafNode(Vec<LogCluster>),
 }
 
-// type TreeNode = HashMap<String, GraphNodeContents>;
 type TreeRoot = FxHashMap<usize, GraphNodeContents>;
+pub type LogTemplate = Vec<LogTemplateItem>;
 
 use regex::{Match, Regex, Split};
 
 use std::fs::{File, read_to_string};
-#[allow(unused_imports)]
 use std::io::{self, prelude::*, BufReader};
-fn parse_emit_csv(filename: &str) -> Result<(), Box<dyn Error>> {
-    let file = File::open(filename)?;
-    let reader = BufReader::new(file);
-
-    // let mut root: BTreeMap<usize, BTreeMap<String, String>>;
-    // let mut last_line: Option<String>;
-
-    // let mut arena: Arena<String> = Arena::new();
-    // let arena: mut Arena<String>;
-    // let a = arena.new_node(GraphNodeContents::Token("xyz".to_string()));
-    // let root = arena.new_node(GraphNodeContents::NumTokens(0));
-    // root.prepend(new_child, arena)
-    // root.insert_after(new_sibling, arena)
-    // arena.nodes[root.index].first_child
-
-    // With input regex <timestamp> <level> <content>
-    // Let's start with a log line "123 INFO mytokens go here now"
-    // First we group with regexes, getting something like:
-    // [timestamp, info, content]
-    // Then we take line['content] and split.
-    // logMessageL = line['content']
-    // We're basically bypassing the tree with our hand-written regex.
-
-    // let mut cluster_id = 0;
-
-    /*for line in reader.lines() {
-    }*/
-    todo!("Use the new API here.");
-    // Ok(())
-}
 
 pub fn print_log(filename: &str) {
-    //let file = File::open("testlog1.txt").unwrap();
-    //let reader = BufReader::new(file);
-    // parse_emit_csv("testlog1.txt");
     // TODO Make a CLI version
-    // TODO emit results as a template plus a dictionary?
-    // template as str minus wildcards?
-    // let s: _ = read_to_string("testlog1.txt").unwrap();
-    // let s: _ = read_to_string("Apache.log").unwrap();
     let s: _ = read_to_string(filename).unwrap();
-    let mut state = ParserState::default();
-    // let mut tables = Vec::<Vec::<Vec::<&str>>>::new();
-    // Let's convert to jsonl.
-    // let mut tables: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut state = ParseTree::default();
     let mut template_names = Vec::new();
-    for record in RecordsParsed::from(&s, &mut state, &mut Vec::new()) {
+    for record in RecordsParsedIter::from(&s, &mut state, &mut Vec::new()) {
         fn handle_parse(template_names: &[String], rp: &RecordParsed) {
-            // let m: HashMap<String, String> = HashMap::new();
-            // prefixes=
-            //let obj = object!["type": typ];
             let typ = &template_names[rp.template_id];
-            let obj = json!({
-                "template": typ,
-                "values": rp.values});
-            //obj.insert(typ, rp.values);
-            info!("json: {}", obj.to_string());
-            // info!("user received: {:?}", rp);
-            // &template_names[rp.template_id];// .push(rp.values);
+            let obj  = json_object!{
+                template: typ,
+                values: ToJSONList(rp.values.to_vec())};
+            info!("json: {}", obj.to_json_string());
         }
 
         match record {
@@ -647,43 +567,12 @@ pub fn print_log(filename: &str) {
                     .iter()
                     .map(|t| t.to_string())
                     .intersperse(" ".to_string())
-                        // .join(", ")
                     .collect::<String>());
 
                     handle_parse(&template_names, &template.first_parse);
             }
             crate::RecordsParsedResult::RecordParsed(rp) => handle_parse(&template_names, &rp),
-            crate::RecordsParsedResult::ParseError(_) => unimplemented!(),
+            crate::RecordsParsedResult::ParseError(e) => error!("err: {}", e),
         }
     }
-}
-
-
-#[cfg(test)]
-mod tests {
-    // Note this useful idiom: importing names from outer (for mod tests) scope.
-    // use super::*;
-
-    use std::{
-        fs::{read_to_string, File},
-        io::BufReader,
-    };
-
-    use crate::{parse_emit_csv, ParserState, RecordsParsed, RecordParsed};
-
-    #[test]
-    fn test_add() {
-        assert_eq!((1 + 2), 3);
-    }
-
-    use log::info;
-    /*
-    #[test]
-    fn test_bad_add() {
-        // This assert would fire and test will fail.
-        // Please note, that private functions can be tested too!
-        assert_eq!((1 - 2), 3);
-    }
-    */
-
 }

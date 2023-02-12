@@ -68,3 +68,15 @@ ALso switch to streaming iterator will stop allocations on every line.
 Before we do those hard changes, let's speed up the output since it's a big chunk remaining.
 
 https://lovasoa.github.io/json_in_type/
+
+
+```
+example-group/parse apache
+                        time:   [35.525 ms 37.009 ms 38.449 ms]
+                        change: [-41.834% -37.323% -32.172%] (p = 0.00 < 0.05)
+                        Performance has improved.
+```
+
+There must be some way to avoid calling to_string() in the common case of walking through the tree.
+https://github.com/rust-lang/rust/issues/56167#issuecomment-468732127
+But it's a lot of work and we're already faster than python despite not having an lru-cache.
