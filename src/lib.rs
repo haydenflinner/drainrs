@@ -2,7 +2,7 @@
 #![feature(hash_raw_entry)]
 //! drainrs implements the [Drain](https://jiemingzhu.github.io/pub/pjhe_icws2017.pdf) algorithm for automatic log parsing.
 //! # Example:
-//! ```
+//! ```bash
 //!  cargo run ./apache-short.log | tail
 //! {"template":"[Sat Jun <*> <*> <*> [error] [client <*> script not found or unable to stat: /var/www/cgi-bin/awstats",
 //! "values":["11","03:03:04","2005]","202.133.98.6]"]}

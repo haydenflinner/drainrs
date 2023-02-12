@@ -1,6 +1,6 @@
 use std::env;
 fn main() {
-    use drain::{print_log};
+    use drainrs::{print_log};
 
     let args: Vec<String> = env::args().collect();
     assert!(args.len() == 2);
