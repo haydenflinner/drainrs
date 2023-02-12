@@ -1,22 +1,19 @@
 [package]
-name = "drain"
+name = "drainrs"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+license="MIT"
+description="An implementation of the drain logparsing algorithm"
+homepage="https://github.com/haydenflinner/rdrain"
+repository="https://github.com/haydenflinner/rdrain"
 
 [dependencies]
 indextree = "4.5.0"
 regex = "1"
 log = "0.4.17"
 thiserror = "1.0"
-# json = "0.12.4"
-# serde_json = "1.0"
 json_in_type = "1.1.1"
-# TODO REMOVE
-simple_logger = "4.0.0"
 rustc-hash = "1.1.0"
-uluru = "3.0.0"
 
 [dev-dependencies]
 simple_logger = "4.0.0"

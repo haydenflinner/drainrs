@@ -1,9 +1,26 @@
 #![feature(iter_intersperse)]
 #![feature(hash_raw_entry)]
-//! rdrain implements the [Drain]() algorithm for automatic log parsing.
+//! drainrs implements the [Drain](https://jiemingzhu.github.io/pub/pjhe_icws2017.pdf) algorithm for automatic log parsing.
 //! # Example:
-//! 
-
+//! ```
+//!  cargo run ./apache-short.log | tail
+//! {"template":"[Sat Jun <*> <*> <*> [error] [client <*> script not found or unable to stat: /var/www/cgi-bin/awstats",
+//! "values":["11","03:03:04","2005]","202.133.98.6]"]}
+//! {"template":"[Sat Jun <*> <*> <*> [error] [client <*> script not found or unable to stat: /var/www/cgi-bin/awstats",
+//! "values":["11","03:03:04","2005]","202.133.98.6]"]}
+//! {"template":"[Sat Jun <*> <*> <*> [error] [client <*> script not found or unable to stat: /var/www/cgi-bin/awstats",
+//! "values":["11","03:03:04","2005]","202.133.98.6]"]}
+//! {"template":"[Sat Jun <*> <*> <*> [error] <*> Can't find child <*> in scoreboard",
+//! "values":["11","03:03:04","2005]","jk2_init()","4210"]}
+//! {"template":"[Sat Jun <*> <*> <*> [notice] workerEnv.init() ok <*>",
+//! "values":["11","03:03:04","2005]","/etc/httpd/conf/workers2.properties"]}
+//! {"template":"[Sat Jun <*> <*> <*> [error] mod_jk child init <*> <*>",
+//! "values":["11","03:03:04","2005]","1","-2"]}
+//! {"template":"[Sat Jun <*> <*> <*> [error] [client <*> script not found or unable to stat: /var/www/cgi-bin/awstats",
+//! "values":["11","03:03:04","2005]","202.133.98.6]"]}
+//! ```
+//!
+//!
 //! # Vocabulary
 //! A **log record** is an entry in a text file, typically one-line but doesn't have to be.
 //!
@@ -21,27 +38,28 @@
 //!   `"[<date>] [<log_level>] Digest logline here: <*>"`
 //!
 //! # TODO
-//! The first drain allowed `split_line_provided`, which let you write a simple token-mapper like this:
+//! * None of the parameters that are configurable in the Python version are yet configurable here.
+//! * The first drain allowed `split_line_provided`, which let you write a simple token-mapper like this:
 //!
 //!   `<timestamp> <loglevel> <content>`
 //!
 //! And then drain would only apply its logic to `<content>`.
 //!
-//! Drain3 appears to have dropped this in favor of preprocessing on the user-code side, which is fair enough.
+//! Drain3 appears to have dropped this in favor of preprocessing on the user-code side, which is fair enough, although
+//! the feature is very helpful from a cli/no-coding perspective.
 //!
-//! Drain3 allows "masking", which appears to be for recognizing values like IPs or numbers.
+//! * Drain3 allows "masking", which appears to be for recognizing values like IPs or numbers.
 //! We have preliminary support for masking but it's not configurable from outside of the class and the user interface
 //! to it is not yet defined.
 
-use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::fmt;
-use std::error::Error;
-use thiserror::Error;
-use log::{debug, info, error};
-use rustc_hash::FxHashMap;
-use json_in_type::*;
+
 use json_in_type::list::ToJSONList;
+use json_in_type::*;
+use log::{debug, error};
+use rustc_hash::FxHashMap;
 use std::iter::zip;
+use thiserror::Error;
 
 /// In the process of parsing, the drain algo populates a ParseTree. This tree could be saved
 /// and re-used on the next run, to avoid "forgetting" the previously recognized log templates.
@@ -49,13 +67,12 @@ use std::iter::zip;
 pub struct ParseTree {
     root: TreeRoot,
     next_cluster_id: usize,
-    // = TreeRoot::new();
 }
 
 fn zip_tokens_and_template<'c>(
     templatetokens: &[LogTemplateItem],
     logtokens: &[TokenParse<'c>],
-    results: &mut Vec<&'c str>
+    results: &mut Vec<&'c str>,
 ) {
     results.clear();
     for (template_token, log_token) in zip(templatetokens, logtokens) {
@@ -130,7 +147,7 @@ pub struct RecordParsed<'a> {
     // pub values: &'short[&'a str],
 }
 
-/// When a new log-template is discovered, rdrain will return this item.
+/// When a new log-template is discovered, drainrs will return this item.
 /// Don't forget to refer to first_parse.
 #[derive(Debug)]
 pub struct NewTemplate<'a> {
@@ -138,7 +155,7 @@ pub struct NewTemplate<'a> {
     pub first_parse: RecordParsed<'a>,
 }
 
-/// 
+/// See doc of each item.
 #[derive(Debug)]
 pub enum RecordsParsedResult<'a> {
     NewTemplate(NewTemplate<'a>),
@@ -156,7 +173,11 @@ pub struct RecordsParsedIter<'a, 'b: 'a> {
 }
 
 impl<'a, 'b> RecordsParsedIter<'a, 'b> {
-    pub fn from(input: &'a str, state: &'b mut ParseTree, parsed_buffer: &'a mut Vec<&'a str>) -> RecordsParsedIter<'a, 'b> {
+    pub fn from(
+        input: &'a str,
+        state: &'b mut ParseTree,
+        parsed_buffer: &'a mut Vec<&'a str>,
+    ) -> RecordsParsedIter<'a, 'b> {
         RecordsParsedIter {
             input,
             state,
@@ -183,7 +204,6 @@ impl<'a, 'b> Iterator for RecordsParsedIter<'a, 'b> {
         // TODO we should be able to handle multi-line logs, but the original paper doesn't.
         // It is easily fixed in the python by looking back, not so simple here.
         // We will probably have to iterate through lines looking ahead.
-
 
         // Step 1. First we split the line to get all of the tokens.
         // add_log_message from drain3.py
@@ -237,7 +257,9 @@ impl<'a, 'b> Iterator for RecordsParsedIter<'a, 'b> {
         }
 
         if tokens.is_empty() {
-            return Some(RecordsParsedResult::ParseError(ParseError::NoTokensInRecord));
+            return Some(RecordsParsedResult::ParseError(
+                ParseError::NoTokensInRecord,
+            ));
         }
 
         // Step 2, we map #(num_tokens) => a parse tree with limited depth.
@@ -251,7 +273,8 @@ impl<'a, 'b> Iterator for RecordsParsedIter<'a, 'b> {
                 &mut self.state.root,
                 &tokens,
                 &mut self.state.next_cluster_id,
-            )).unwrap();
+            ))
+            .unwrap();
             self.parsed.clear();
             zip_tokens_and_template(&match_cluster.template, &tokens, self.parsed);
             return Some(Self::Item::NewTemplate(NewTemplate {
@@ -277,18 +300,6 @@ impl<'a, 'b> Iterator for RecordsParsedIter<'a, 'b> {
             template_id: match_cluster.cluster_id,
         }));
     }
-}
-// First map using token length, then map based on tokens until maxDepth, then we've found it.
-// If all digits token, replace with "*"
-fn similar_sequence_score(seq1: &Vec<&str>, seq2: &Vec<&str>) -> usize {
-    let mut sum: usize = 0;
-    for (i, x) in seq1.iter().enumerate() {
-        if i >= seq2.len() {
-            break;
-        }
-        sum += (*x == seq2[i]) as usize;
-    }
-    sum / seq1.len()
 }
 
 fn has_numbers(s: &str) -> bool {
@@ -401,13 +412,12 @@ fn add_seq_to_prefix_tree<'a>(
                 // if token not matched in this layer of existing tree.
                 let num_children = middle.child_d.len();
                 match token {
-                    TokenParse::MaskedValue(v) => middle
+                    TokenParse::MaskedValue(_v) => middle
                         .child_d
                         .entry(LogTemplateItem::Value)
                         .or_insert_with(inserter),
                     TokenParse::Token(token) => {
-                        let perfect_match_key =
-                            LogTemplateItem::StaticToken(token.to_string());
+                        let perfect_match_key = LogTemplateItem::StaticToken(token.to_string());
                         let found_node = middle.child_d.contains_key(&perfect_match_key);
 
                         // Double-lookup pleases the borrow-checker :shrug:
@@ -442,13 +452,11 @@ fn add_seq_to_prefix_tree<'a>(
                     template: tokens
                         .iter()
                         .map(|tp| match tp {
-                            TokenParse::Token(t) => {
-                                match has_numbers(t) {
-                                    true => LogTemplateItem::Value,
-                                    false => LogTemplateItem::StaticToken(t.to_string()),
-                                }
-                            }
-                            TokenParse::MaskedValue(v) => LogTemplateItem::Value,
+                            TokenParse::Token(t) => match has_numbers(t) {
+                                true => LogTemplateItem::Value,
+                                false => LogTemplateItem::StaticToken(t.to_string()),
+                            },
+                            TokenParse::MaskedValue(_v) => LogTemplateItem::Value,
                         })
                         .collect(),
                     cluster_id: clust_id,
@@ -493,7 +501,7 @@ fn tree_search<'a>(root: &'a TreeRoot, tokens: &[TokenParse]) -> Option<&'a LogC
 
         // If we know it's a Value, go ahead and take that branch.
         match token {
-            TokenParse::MaskedValue(v) => {
+            TokenParse::MaskedValue(_v) => {
                 let maybe_next = middle.child_d.get(&LogTemplateItem::Value);
                 if let Some(next) = maybe_next {
                     cur_node = next;
@@ -541,35 +549,46 @@ enum GraphNodeContents {
 type TreeRoot = FxHashMap<usize, GraphNodeContents>;
 pub type LogTemplate = Vec<LogTemplateItem>;
 
-use regex::{Match, Regex, Split};
+use regex::Regex;
 
-use std::fs::{File, read_to_string};
-use std::io::{self, prelude::*, BufReader};
+use std::fs::read_to_string;
 
-pub fn print_log(filename: &str) {
-    // TODO Make a CLI version
+/// Barebones example usage of the crate. Reads whole file into memory.
+pub fn print_log(filename: &str, actually_print: bool) {
+    // Abstraction review is due here. We don't need the whole file,
+    // we support streaming. It seems a line-based iterator is probably best,
+    // as an alternative "chunks" leaves us having to deal with partial-line reads.
+    // But right now creating a RecordsParsedIter involves some allocation.
+    // So for now we'll stick with read_to_string.
+    // Probably solution is to move most of the fields of iter out to a ParserState
+    // Then user doesn't have to fiddle with making each piece individually here, either.
     let s: _ = read_to_string(filename).unwrap();
-    let mut state = ParseTree::default();
+    let mut tree = ParseTree::default();
     let mut template_names = Vec::new();
-    for record in RecordsParsedIter::from(&s, &mut state, &mut Vec::new()) {
-        fn handle_parse(template_names: &[String], rp: &RecordParsed) {
-            let typ = &template_names[rp.template_id];
-            let obj  = json_object!{
-                template: typ,
-                values: ToJSONList(rp.values.to_vec())};
-            info!("json: {}", obj.to_json_string());
+    let handle_parse = |template_names: &[String], rp: &RecordParsed| {
+        let typ = &template_names[rp.template_id];
+        let obj = json_object! {
+            template: typ,
+            values: ToJSONList(rp.values.to_vec())};
+        if actually_print {
+            println!("{}", obj.to_json_string());
         }
+    };
+
+    for record in RecordsParsedIter::from(&s, &mut tree, &mut Vec::new()) {
 
         match record {
             RecordsParsedResult::NewTemplate(template) => {
                 template_names.push(
-                    template.template
-                    .iter()
-                    .map(|t| t.to_string())
-                    .intersperse(" ".to_string())
-                    .collect::<String>());
+                    template
+                        .template
+                        .iter()
+                        .map(|t| t.to_string())
+                        .intersperse(" ".to_string())
+                        .collect::<String>(),
+                );
 
-                    handle_parse(&template_names, &template.first_parse);
+                handle_parse(&template_names, &template.first_parse);
             }
             crate::RecordsParsedResult::RecordParsed(rp) => handle_parse(&template_names, &rp),
             crate::RecordsParsedResult::ParseError(e) => error!("err: {}", e),

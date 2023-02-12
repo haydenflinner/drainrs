@@ -5,8 +5,8 @@ use drain::print_log;
 fn criterion_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("example-group");
     group.sample_size(10);
-    group.bench_function("parse apache", |b| b.iter(|| 
-        print_log("Apache.log")
+    group.bench_function("parse apache", |b| b.iter(||
+        print_log("Apache.log", false)
         ));
 }
 
