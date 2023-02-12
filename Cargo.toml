@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 license="MIT"
 description="An implementation of the drain logparsing algorithm"
-homepage="https://github.com/haydenflinner/rdrain"
-repository="https://github.com/haydenflinner/rdrain"
+homepage="https://github.com/haydenflinner/drainrs"
+repository="https://github.com/haydenflinner/drainrs"
 
 [dependencies]
 indextree = "4.5.0"
