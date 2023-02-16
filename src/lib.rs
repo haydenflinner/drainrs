@@ -1,5 +1,6 @@
 #![feature(iter_intersperse)]
 #![feature(hash_raw_entry)]
+#![feature(inherent_associated_types)]
 //! drainrs implements the [Drain](https://jiemingzhu.github.io/pub/pjhe_icws2017.pdf) algorithm for automatic log parsing.
 //! # Example:
 //! ```bash
@@ -150,48 +151,50 @@ pub struct RecordParsed<'a> {
 /// When a new log-template is discovered, drainrs will return this item.
 /// Don't forget to refer to first_parse.
 #[derive(Debug)]
-pub struct NewTemplate<'a> {
+pub struct NewTemplate {
     pub template: LogTemplate,
-    pub first_parse: RecordParsed<'a>,
 }
 
 /// See doc of each item.
 #[derive(Debug)]
 pub enum RecordsParsedResult<'a> {
-    NewTemplate(NewTemplate<'a>),
+    NewTemplate(NewTemplate),
     RecordParsed(RecordParsed<'a>),
     ParseError(ParseError),
+    UnparsedLine(&'a str),
+    Done,
 }
 
 /// Iterator yielding every log record in the input string. A log record is generally a log-line,
 /// but can be multi-line.
 pub struct RecordsParsedIter<'a, 'b: 'a> {
-    pub input: &'a str,
+    input: &'a str,
     pub state: &'b mut ParseTree,
     tokens: Vec<TokenParse<'a>>,
-    parsed: &'a mut Vec<&'a str>,
+    parsed: Vec<&'a str>,
 }
 
 impl<'a, 'b> RecordsParsedIter<'a, 'b> {
+    type Item = RecordsParsedResult<'a>;
+
     pub fn from(
         input: &'a str,
         state: &'b mut ParseTree,
-        parsed_buffer: &'a mut Vec<&'a str>,
+        // parsed_buffer: &'a mut Vec<&'a str>,
     ) -> RecordsParsedIter<'a, 'b> {
         RecordsParsedIter {
             input,
             state,
             tokens: Vec::new(),
-            parsed: parsed_buffer,
+            parsed: Vec::new(),
         }
     }
-}
 
-impl<'a, 'b> Iterator for RecordsParsedIter<'a, 'b> {
-    type Item = RecordsParsedResult<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next<F, R>(&mut self, mut callback: F) -> R
+    where
+        F: FnMut(RecordsParsedResult<'a>) -> R,
+    {
+        // f()
         let split_result = self.input.split_once('\n');
         let (line, next_input) = match split_result {
             Some((line, rest)) => (line.strip_suffix('\r').unwrap_or(line), rest),
@@ -199,7 +202,10 @@ impl<'a, 'b> Iterator for RecordsParsedIter<'a, 'b> {
         };
         self.input = next_input;
         if line.is_empty() {
-            return None;
+            return match next_input.is_empty() {
+                true => callback(RecordsParsedResult::Done),
+                false => callback(RecordsParsedResult::UnparsedLine(line)),
+            };
         }
         // TODO we should be able to handle multi-line logs, but the original paper doesn't.
         // It is easily fixed in the python by looking back, not so simple here.
@@ -208,20 +214,25 @@ impl<'a, 'b> Iterator for RecordsParsedIter<'a, 'b> {
         // Step 1. First we split the line to get all of the tokens.
         // add_log_message from drain3.py
         // E.g. splits the line into chunks <timestamp> <loglevel> <content>
-        let line_chunks = split_line_provided(line); // Pre-defined chunks as user-specified, like <Time> <Content>
-        if line_chunks.is_none() {
-            // Couldn't parse with the given regex, it's probably a multiline string. Attach it to the last-emitted log.
-            // TODO attach_to_last_line(line);
-            return Some(RecordsParsedResult::ParseError(
-                ParseError::NoTokensInRecord,
-            ));
-        }
+        // This was a no-op so I removed it. Should be able to find a way to structure the API in the future to avoid allocating return space.
+        // let line_chunks = split_line_provided(line); // Pre-defined chunks as user-specified, like <Time> <Content>
+        // TODO Copy regex from python, return list of spanning indicators.
+        // if line_chunks.is_none() {
+        // Couldn't parse with the given regex, it's probably a multiline string. Attach it to the last-emitted log.
+        // TODO attach_to_last_line(line);
+        // return callback(RecordsParsedResult::ParseError(
+        // ParseError::NoTokensInRecord,
+        // ));
+        // }
         // TODO Let Content be something not the last thing in the msg, like for trailing log-line tags.
-        let line_chunks = line_chunks.unwrap();
-        let log_content = *line_chunks.iter().rev().next().unwrap();
+        // let line_chunks = line_chunks.unwrap();
+        // let log_content = *line_chunks.iter().rev().next().unwrap();
+        let log_content = line;
 
         // This is the masking feature from drain3; not clear what scenarios
         // would be best to use it, but running without it for now.
+        // It seems we could use a combo of map and flatten to end up with an iterator longer than the source iterator.
+        // But preprocessed never gets resized so it's not hurting anything.
         let mut preprocessed = Vec::new();
         if false {
             let re = Regex::new(r"\d+").unwrap();
@@ -257,7 +268,7 @@ impl<'a, 'b> Iterator for RecordsParsedIter<'a, 'b> {
         }
 
         if tokens.is_empty() {
-            return Some(RecordsParsedResult::ParseError(
+            return callback(RecordsParsedResult::ParseError(
                 ParseError::NoTokensInRecord,
             ));
         }
@@ -276,16 +287,16 @@ impl<'a, 'b> Iterator for RecordsParsedIter<'a, 'b> {
             ))
             .unwrap();
             self.parsed.clear();
-            zip_tokens_and_template(&match_cluster.template, &tokens, self.parsed);
-            return Some(Self::Item::NewTemplate(NewTemplate {
+            zip_tokens_and_template(&match_cluster.template, &tokens, &mut self.parsed);
+            callback(Self::Item::NewTemplate(NewTemplate {
                 // We can't return this because it would imply that our mutable self borrow in Self::next outlives 'a.
                 // We could make this less-copy by using a streaming-iterator or just taking callbacks to call.
                 // Unclear which would be more idiomatic, so leaving it alone for now.
                 template: match_cluster.template.to_vec(),
-                first_parse: RecordParsed {
-                    values: self.parsed.to_vec(),
-                    template_id: match_cluster.cluster_id,
-                },
+            }));
+            return callback(Self::Item::RecordParsed(RecordParsed {
+                values: self.parsed.to_vec(),
+                template_id: match_cluster.cluster_id,
             }));
         }
         let match_cluster = match_cluster.unwrap();
@@ -294,8 +305,8 @@ impl<'a, 'b> Iterator for RecordsParsedIter<'a, 'b> {
         // maintaining its lifetime as pointing to the original record. but skipped for now
         // since can't figure out how to do that without .collect().
         self.parsed.clear();
-        zip_tokens_and_template(&match_cluster.template, &tokens, self.parsed);
-        return Some(Self::Item::RecordParsed(RecordParsed {
+        zip_tokens_and_template(&match_cluster.template, &tokens, &mut self.parsed);
+        return callback(Self::Item::RecordParsed(RecordParsed {
             values: self.parsed.to_vec(),
             template_id: match_cluster.cluster_id,
         }));
@@ -304,11 +315,6 @@ impl<'a, 'b> Iterator for RecordsParsedIter<'a, 'b> {
 
 fn has_numbers(s: &str) -> bool {
     s.chars().any(char::is_numeric)
-}
-
-fn split_line_provided(_line: &str) -> Option<Vec<&str>> {
-    // TODO Copy regex from python, return list of spanning indicators.
-    Some(vec![_line])
 }
 
 #[derive(Debug)]
@@ -568,30 +574,47 @@ pub fn print_log(filename: &str, actually_print: bool) {
     let handle_parse = |template_names: &[String], rp: &RecordParsed| {
         let typ = &template_names[rp.template_id];
         let obj = json_object! {
-            template: typ,
-            values: ToJSONList(rp.values.to_vec())};
+        template: typ,
+        values: ToJSONList(rp.values.to_vec())};
         if actually_print {
             println!("{}", obj.to_json_string());
         }
+        true
     };
 
-    for record in RecordsParsedIter::from(&s, &mut tree, &mut Vec::new()) {
-
-        match record {
-            RecordsParsedResult::NewTemplate(template) => {
-                template_names.push(
-                    template
-                        .template
-                        .iter()
-                        .map(|t| t.to_string())
-                        .intersperse(" ".to_string())
-                        .collect::<String>(),
-                );
-
-                handle_parse(&template_names, &template.first_parse);
+    let mut rpi = RecordsParsedIter::from(&s, &mut tree);
+    loop {
+        let handle = |record| {
+            match record {
+                RecordsParsedResult::NewTemplate(template) => {
+                    template_names.push(
+                        template
+                            .template
+                            .iter()
+                            .map(|t| t.to_string())
+                            .intersperse(" ".to_string())
+                            .collect::<String>(),
+                    );
+                    // handle_parse(&template_names, &template.first_parse);
+                    true
+                }
+                RecordsParsedResult::RecordParsed(rp) => handle_parse(&template_names, &rp),
+                RecordsParsedResult::ParseError(e) => {
+                    error!("err: {}", e);
+                    false
+                }
+                RecordsParsedResult::UnparsedLine(line) => {
+                    error!("unparsed: {}", line);
+                    false
+                }
+                RecordsParsedResult::Done => {
+                    log::info!("Done!");
+                    false
+                }
             }
-            crate::RecordsParsedResult::RecordParsed(rp) => handle_parse(&template_names, &rp),
-            crate::RecordsParsedResult::ParseError(e) => error!("err: {}", e),
+        };
+        if !rpi.next(handle) {
+            break;
         }
     }
 }

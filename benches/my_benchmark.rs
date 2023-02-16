@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use drain::print_log;
+use drainrs::print_log;
 
 fn criterion_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("example-group");

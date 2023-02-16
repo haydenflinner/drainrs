@@ -80,3 +80,24 @@ example-group/parse apache
 There must be some way to avoid calling to_string() in the common case of walking through the tree.
 https://github.com/rust-lang/rust/issues/56167#issuecomment-468732127
 But it's a lot of work and we're already faster than python despite not having an lru-cache.
+
+Let's use the entry API to make sure we aren't calling to_string at every step along walking the map.
+Holy cow. Will be difficult because key type is not string, it's an enum over string. No-thanks.
+http://idubrov.name/rust/2018/06/01/tricking-the-hashmap.html#fnref:3
+
+Let's go for an LRU cache instead. It looks like we spend about half of our time tokenizing and about half of our time tree searching.
+In the common case of repeated lines when logging contents of a list, an LRU cache would be fine.
+Though we still need to tokenize to be able to use our template.
+
+
+Actually, all we did was switch to a callback rather than using an iterator (and moving a vector at each return.)
+```
+example-group/parse apache
+                        time:   [29.704 ms 29.849 ms 30.022 ms]
+                        change: [-15.626% -10.211% -5.4188%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+```
+ASlways one outlier, not sure why.
+Note that we went back to 36ms when capturing the flamegraph; this is the first time i've noticed a performance overhead to tracing this!
