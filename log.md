@@ -101,38 +101,3 @@ Found 1 outliers among 10 measurements (10.00%)
 ```
 ASlways one outlier, not sure why.
 Note that we went back to 36ms when capturing the flamegraph; this is the first time i've noticed a performance overhead to tracing this!
-
-
-
-Uninuttive errors:
-```
-   |
-   = note: `#[warn(unused_imports)]` on by default
-
-error[E0277]: the trait bound `[u8]: From<&BStr>` is not satisfied
-   --> src/lib.rs:202:59
-    |
-202 |             None => (self.input.into(), &self.input[0..0].into()),
-    |                                                           ^^^^ the trait `From<&BStr>` is not implemented for `[u8]`
-    |
-    = help: the trait `From<&'a BStr>` is implemented for `&'a [u8]`
-    = note: required for `&BStr` to implement `Into<[u8]>`
-
-error[E0308]: mismatched types
-   --> src/lib.rs:204:22
-    |
-204 |         self.input = next_input;
-    |         ----------   ^^^^^^^^^^ expected `&BStr`, found `&[u8]`
-    |         |
-    |         expected due to the type of this binding
-    |
-    = note: expected reference `&'a BStr`
-               found reference `&[u8]`
-help: call `Into::into` on this expression to convert `&[u8]` into `&'a BStr`
-    |
-204 |         self.input = next_input.into();
-```
-
-
-WEll we clearly made things much slower by doig this. where are the unnecessary copies?
-Who knows, probably we should use a bunch of Cows in memory.
