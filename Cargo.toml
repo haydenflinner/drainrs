@@ -19,6 +19,7 @@ log = "0.4.17"
 thiserror = "1.0"
 json_in_type = "1.1.1"
 rustc-hash = "1.1.0"
+borrowme = "0.0.14"
 
 [dev-dependencies]
 simple_logger = "4.0.0"

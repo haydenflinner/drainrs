@@ -101,3 +101,26 @@ Found 1 outliers among 10 measurements (10.00%)
 ```
 ASlways one outlier, not sure why.
 Note that we went back to 36ms when capturing the flamegraph; this is the first time i've noticed a performance overhead to tracing this!
+
+
+There was a bad API try here that took us to 80ms. Reverted, check git history.
+
+
+
+
+
+
+33ms on 2023-05-25, not thinking there were any changes.
+Now, let's try not copying strings into the map while parsing.
+
+
+
+Done! Holy cow it took two months. raw entry mut and a lot of ugly.
+     Running benches/my_benchmark.rs (target/release/deps/my_benchmark-200a1c07e73fbf3d)
+example-group/parse apache
+                        time:   [25.277 ms 25.341 ms 25.433 ms]
+                        change: [-0.5957% +0.2476% +1.2038%] (p = 0.61 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high mild
+

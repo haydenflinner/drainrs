@@ -53,14 +53,17 @@
 //! We have preliminary support for masking but it's not configurable from outside of the class and the user interface
 //! to it is not yet defined.
 
-use std::fmt;
+use std::{collections::hash_map::RawEntryMut, fmt};
 
+use borrowme::borrowme;
 use json_in_type::list::ToJSONList;
 use json_in_type::*;
 use log::{debug, error};
 use rustc_hash::FxHashMap;
 use std::iter::zip;
 use thiserror::Error;
+
+use std::hash::{BuildHasher, Hash};
 
 /// In the process of parsing, the drain algo populates a ParseTree. This tree could be saved
 /// and re-used on the next run, to avoid "forgetting" the previously recognized log templates.
@@ -71,20 +74,29 @@ pub struct ParseTree {
 }
 
 fn zip_tokens_and_template<'c>(
-    templatetokens: &[LogTemplateItem],
+    templatetokens: &[OwnedLogTemplateItem],
     logtokens: &[TokenParse<'c>],
     results: &mut Vec<&'c str>,
 ) {
     results.clear();
     for (template_token, log_token) in zip(templatetokens, logtokens) {
         match template_token {
-            LogTemplateItem::StaticToken(_) => {}
-            LogTemplateItem::Value => match log_token {
+            OwnedLogTemplateItem::StaticToken(_) => {}
+            OwnedLogTemplateItem::Value => match log_token {
                 TokenParse::Token(v) => results.push(*v),
                 TokenParse::MaskedValue(v) => results.push(*v),
             },
         }
     }
+}
+
+#[borrowme]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+// #[borrowed_attr(derive(Debug, PartialEq, Eq, Hash, Clone))]
+#[borrowed_attr(derive(Copy))]
+pub enum LogTemplateItem<'a> {
+    StaticToken(&'a str), // Owned because we need to store it.
+    Value,                // Python port used "<*>" instead.
 }
 
 /// The elements in a LogTemplate (not a record).
@@ -95,13 +107,41 @@ fn zip_tokens_and_template<'c>(
 ///  the parsed rich-type form would be:
 ///
 ///   `[Value, Value, StaticToken("Digest"), StaticToken("logline"), StaticToken("here:"), Value]`
+/*
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum LogTemplateItem {
     StaticToken(String), // Owned because we need to store it.
     Value,               // Python port used "<*>" instead.
 }
+// TODO Rather than hold same enums, just store the string and pass it on to the LogTempalteItem!
+// pub struct LogTemplateItem {
+//     s: String,
+//     i: LogTemplateItem,
+// }
+// TODO use this? Or can use two separate maps and skip all of this mess lmao
+// https://docs.rs/borrowme/latest/borrowme/
 
 impl fmt::Display for LogTemplateItem {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::StaticToken(s) => s,
+                Self::Value => "<*>",
+            }
+        )
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub enum LogTemplateItem<'a> {
+    StaticToken(&'a str), // Owned because we need to store it.
+    Value,                // Python port used "<*>" instead.
+}
+
+*/
+impl fmt::Display for LogTemplateItem<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -113,6 +153,40 @@ impl fmt::Display for LogTemplateItem {
         )
     }
 }
+impl fmt::Display for OwnedLogTemplateItem {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::StaticToken(s) => s,
+                Self::Value => "<*>",
+            }
+        )
+    }
+}
+
+// impl<'a> Borrow<LogTemplateItem<'_>> for OwnedLogTemplateItem {
+//     #[inline]
+//     fn borrow<'b>(&self) -> &LogTemplateItem<'b> {
+//         match self {
+//             LogTemplateItem::StaticToken(s) => &LogTemplateItem::StaticToken(s.borrow()),
+//             LogTemplateItem::Value => &LogTemplateItem::Value,
+//         }
+//     }
+// }
+/*
+impl Borrow<LogTemplateItem> for LogTemplateItem {
+    #[inline]
+    fn borrow(&self) -> LogTemplateItem<'_> {
+        // self.i.borrow()
+        match self {
+            LogTemplateItem::StaticToken(s) => &LogTemplateItem::StaticToken(s.borrow()),
+            LogTemplateItem::Value => &LogTemplateItem::Value,
+        }
+    }
+}
+*/
 
 #[derive(Debug)]
 enum TokenParse<'a> {
@@ -324,7 +398,7 @@ struct LogCluster {
     // size: i64 from Python == num_matches. Why track this? Seems to be only for debugging.
 }
 
-fn sequence_distance(seq1: &[LogTemplateItem], seq2: &[TokenParse]) -> (f64, i64) {
+fn sequence_distance(seq1: &[OwnedLogTemplateItem], seq2: &[TokenParse]) -> (f64, i64) {
     assert!(seq1.len() == seq2.len());
     if seq1.is_empty() {
         return (1.0, 0);
@@ -333,8 +407,8 @@ fn sequence_distance(seq1: &[LogTemplateItem], seq2: &[TokenParse]) -> (f64, i64
     let mut num_of_par = 0;
     for (token1, token2) in seq1.iter().zip(seq2.iter()) {
         match token1 {
-            LogTemplateItem::Value => num_of_par += 1,
-            LogTemplateItem::StaticToken(token1) => match token2 {
+            OwnedLogTemplateItem::Value => num_of_par += 1,
+            OwnedLogTemplateItem::StaticToken(token1) => match token2 {
                 TokenParse::Token(token2) => {
                     if token1 == token2 {
                         sim_tokens += 1
@@ -380,6 +454,13 @@ fn fast_match<'a>(logclusts: &'a Vec<LogCluster>, tokens: &[TokenParse]) -> Opti
     }
 }
 
+fn compute_hash<K: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &K) -> u64 {
+    use core::hash::Hasher;
+    let mut state = hash_builder.build_hasher();
+    key.hash(&mut state);
+    state.finish()
+}
+
 const MAX_DEPTH: usize = 4;
 const MAX_CHILDREN: usize = 100;
 fn add_seq_to_prefix_tree<'a>(
@@ -418,34 +499,67 @@ fn add_seq_to_prefix_tree<'a>(
                 // if token not matched in this layer of existing tree.
                 let num_children = middle.child_d.len();
                 match token {
-                    TokenParse::MaskedValue(_v) => middle
-                        .child_d
-                        .entry(LogTemplateItem::Value)
-                        .or_insert_with(inserter),
+                    TokenParse::MaskedValue(_v) => {
+                        middle
+                            .child_d
+                            .raw_entry_mut()
+                            .from_key(&OwnedLogTemplateItem::Value)
+                            .or_insert_with(|| (OwnedLogTemplateItem::Value, inserter()))
+                            .1
+                    }
+                    // https://stackoverflow.com/questions/36480845/how-to-avoid-temporary-allocations-when-using-a-complex-key-for-a-hashmap
+                    // https://internals.rust-lang.org/t/pre-rfc-abandonning-morals-in-the-name-of-performance-the-raw-entry-api/70431
+                    // It's possible that and_modify and _or_insert might be usd here but we really change at runtime to another entry
+                    // syntactically this is ugly but whatever. we don't copy the strings anymore 8)
                     TokenParse::Token(token) => {
-                        let perfect_match_key = LogTemplateItem::StaticToken(token.to_string());
-                        let found_node = middle.child_d.contains_key(&perfect_match_key);
-
-                        // Double-lookup pleases the borrow-checker :shrug:
-                        if found_node {
-                            middle.child_d.get_mut(&perfect_match_key).unwrap()
-                        } else {
-                            // At first glance, skipping over '*' entries here is unintuitive. However, if we've made it to
-                            // adding, then there was not a satisfactory match in the tree already. So we'll copy the original
-                            // algo and make a new node even if there is already a star here, as long as no numbers.
-                            // if self.parametrize_numeric_tokens
-                            // If it's a numerical token, take the * path.
-                            if has_numbers(token) || num_children >= MAX_CHILDREN {
-                                middle
+                        let perfect_match_key = LogTemplateItem::StaticToken(token);
+                        let hash = compute_hash(middle.child_d.hasher(), &perfect_match_key);
+                        // let found_node = middle.child_d.contains_key(&perfect_match_key);
+                        let entry = middle
+                            .child_d
+                            .raw_entry()
+                            .from_hash(hash, |q| borrowme::borrow(q) == perfect_match_key);
+                        match entry {
+                            Some(_) => {
+                                // don't borrow mutably until we know it's there
+                                let entry = middle
                                     .child_d
-                                    .entry(LogTemplateItem::Value)
-                                    .or_insert_with(inserter)
-                            } else {
-                                // It's not a numerical token, and there is room (maxChildren), add it.
-                                middle
-                                    .child_d
-                                    .entry(perfect_match_key)
-                                    .or_insert_with(inserter)
+                                    .raw_entry_mut()
+                                    .from_hash(hash, |q| borrowme::borrow(q) == perfect_match_key);
+                                match entry {
+                                    RawEntryMut::Occupied(view) => view.into_mut(),
+                                    RawEntryMut::Vacant(_) => unreachable!(),
+                                }
+                            }
+                            None => {
+                                // At first glance, skipping over '*' entries here is unintuitive. However, if we've made it to
+                                // adding, then there was not a satisfactory match in the tree already. So we'll copy the original
+                                // algo and make a new node even if there is already a star here, as long as no numbers.
+                                // if self.parametrize_numeric_tokens
+                                // If it's a numerical token, take the * path.
+                                if has_numbers(token) || num_children >= MAX_CHILDREN {
+                                    middle
+                                        .child_d
+                                        .entry(OwnedLogTemplateItem::Value)
+                                        .or_insert_with(inserter)
+                                } else {
+                                    // It's not a numerical token, and there is room (maxChildren), add it.
+                                    middle
+                                        .child_d
+                                        .raw_entry_mut()
+                                        .from_hash(hash, |q| {
+                                            borrowme::borrow(q) == perfect_match_key
+                                        })
+                                        .or_insert_with(|| {
+                                            (
+                                                OwnedLogTemplateItem::StaticToken(
+                                                    token.to_string(),
+                                                ),
+                                                inserter(),
+                                            )
+                                        })
+                                        .1
+                                }
                             }
                         }
                     }
@@ -459,10 +573,10 @@ fn add_seq_to_prefix_tree<'a>(
                         .iter()
                         .map(|tp| match tp {
                             TokenParse::Token(t) => match has_numbers(t) {
-                                true => LogTemplateItem::Value,
-                                false => LogTemplateItem::StaticToken(t.to_string()),
+                                true => OwnedLogTemplateItem::Value,
+                                false => OwnedLogTemplateItem::StaticToken(t.to_string()),
                             },
-                            TokenParse::MaskedValue(_v) => LogTemplateItem::Value,
+                            TokenParse::MaskedValue(_v) => OwnedLogTemplateItem::Value,
                         })
                         .collect(),
                     cluster_id: clust_id,
@@ -508,7 +622,7 @@ fn tree_search<'a>(root: &'a TreeRoot, tokens: &[TokenParse]) -> Option<&'a LogC
         // If we know it's a Value, go ahead and take that branch.
         match token {
             TokenParse::MaskedValue(_v) => {
-                let maybe_next = middle.child_d.get(&LogTemplateItem::Value);
+                let maybe_next = middle.child_d.get(&OwnedLogTemplateItem::Value);
                 if let Some(next) = maybe_next {
                     cur_node = next;
                 } else {
@@ -517,12 +631,17 @@ fn tree_search<'a>(root: &'a TreeRoot, tokens: &[TokenParse]) -> Option<&'a LogC
             }
             TokenParse::Token(token) => {
                 // Actually walking to next child, look for the token, or a wildcard, or fail.
-                let maybe_next = middle
+                let key = LogTemplateItem::StaticToken(token);
+                let hash = compute_hash(middle.child_d.hasher(), &key);
+                let entry = middle
                     .child_d
-                    .get(&LogTemplateItem::StaticToken(token.to_string()));
+                    .raw_entry()
+                    .from_hash(hash, |q| borrowme::borrow(q) == key);
+                let maybe_next = entry;
+                // let maybe_next = middle.child_d.get(&LogTemplateItem::StaticToken(token));
                 if let Some(next) = maybe_next {
-                    cur_node = next;
-                } else if let Some(wildcard) = middle.child_d.get(&LogTemplateItem::Value) {
+                    cur_node = next.1;
+                } else if let Some(wildcard) = middle.child_d.get(&OwnedLogTemplateItem::Value) {
                     cur_node = wildcard;
                 } else {
                     return None; // Tried going down prefix tree that did not exist, need to make a new entry.
@@ -543,7 +662,7 @@ fn tree_search<'a>(root: &'a TreeRoot, tokens: &[TokenParse]) -> Option<&'a LogC
 
 #[derive(Debug)]
 struct MiddleNode {
-    child_d: FxHashMap<LogTemplateItem, GraphNodeContents>,
+    child_d: FxHashMap<OwnedLogTemplateItem, GraphNodeContents>,
 }
 
 #[derive(Debug)]
@@ -553,7 +672,7 @@ enum GraphNodeContents {
 }
 
 type TreeRoot = FxHashMap<usize, GraphNodeContents>;
-pub type LogTemplate = Vec<LogTemplateItem>;
+pub type LogTemplate = Vec<OwnedLogTemplateItem>;
 
 use regex::Regex;
 
