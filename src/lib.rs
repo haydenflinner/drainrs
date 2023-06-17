@@ -427,6 +427,7 @@ fn sequence_distance(seq1: &[OwnedLogTemplateItem], seq2: &[TokenParse]) -> (f64
 }
 
 // const SIMILARITY_THRESHOLD: f64 = 0.7;
+// All constants defaults pulled from drain3.py
 const SIMILARITY_THRESHOLD: f64 = 0.4;
 fn fast_match<'a>(logclusts: &'a Vec<LogCluster>, tokens: &[TokenParse]) -> Option<&'a LogCluster> {
     // Sequence similarity search.
